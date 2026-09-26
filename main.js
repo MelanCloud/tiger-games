@@ -16,8 +16,10 @@ const COLOR = {
   ink: '#3d2b6b',     // main text, player
 };
 
+// boss attacks are mud: dark brown edges, lighter brown centers
+const MUD = { dark: '#3e2616', deep: '#5c3a22', mid: '#8b5a33', light: '#b8834f', pale: '#d9b48a' };
+
 const FALLBACK_SONG_LENGTH = 30; // seconds, for a boss with no song (or one that fails to load)
-const MUSIC_VOLUME = 0.7;
 const BAR = { w: (canvas.width - 80) / 4, y: 24, capH: 14 };
 BAR.x = (canvas.width - BAR.w) / 2; // centered
 
@@ -27,13 +29,21 @@ const REGEN_ANIM = 0.5;   // seconds of "lines burst outward" before the orb app
 const END_DELAY = 1.2;    // seconds of win/lose escape animation before the result panel
 
 // boss attacks: a random one every SHOT.interval (placeholder scheduler until songs drive the patterns)
-const SHOT = { interval: 1.2, speed: 280, r: 10 };
+const SHOT = {
+  interval: 1.2, speed: 280, r: 10,
+  // mud balls the pig throws: launched fast, easing down to a slow cruise, and curving toward the player
+  launchSpeed: 950, // px per second as it leaves the pig
+  cruiseSpeed: 180, // px per second it settles to
+  easeTime: 0.35,   // seconds for most of the extra speed to wear off
+  curve: 0.4,       // max turn toward the player, radians per second (about 23 degrees a second)
+};
 const BOMB = {
   r: 14,
   minDist: 120,                 // shortest throw; the longest reaches the arena edge along the chosen direction
   drag: 1.4,                    // bombs skid to a stop (travel = launch speed / drag)
-  fuse: 2.2,                    // seconds until it explodes
+  fuse: 2.0,                    // seconds until it explodes (4 beats at 120 BPM)
   blastSpeed: 240,              // speed of the 8 projectiles it releases
+  gravity: 110,                 // px/s^2 pulling those 8 down, slowly but steadily
   spread: 65 * Math.PI / 180,   // valid throw cone: +/- this from straight left
 };
 // vertical beam: outlined column charges, then a fast beam sweeps across it, then it dissipates into harmless sparks
@@ -61,6 +71,7 @@ const SPINNER = {
   length: Math.hypot(canvas.width, canvas.height), // long enough to cross the whole arena from anywhere in it
   width: 18,
   hitCooldown: 0.8,   // after a hit, the laser can't hurt again for this long
+  startSpread: 20 * Math.PI / 180, // the laser starts within this angle of pointing straight away from the player
 };
 let spinner = null; // { x, y, vx, vy, t, phase, firing, angle0, angle, dir, cool }
 
@@ -89,6 +100,56 @@ const promptPoints = combo => POINTS_PER_PROMPT * combo;
 const comboCallout = n => n === 2 ? 'Double!' : n === 3 ? 'TRIPLE!' : n === 4 ? 'QUADRUPLE!!!' : n > 4 ? `${n}x COMBO!!!` : null;
 
 const BOSS_HOME_X = canvas.width - 120;
+const BOSS_HOME_Y = canvas.height / 2;
+const BOSS_BOB = 10; // px the boss floats up and down, one full bob every two beats
+const BOSS_ROCK = 5 * Math.PI / 180; // how far the boss rocks side to side, leaning the other way on every beat
+const BOSS_DRIFT = 14; // px the boss drifts left and right every four beats (with the bob, it traces a figure-eight)
+const BOSS_SQUISH = 0.03; // how much the boss squashes wide and stretches tall, once per beat
+const BOSS_HOP = 10; // px the boss hops on a bass kick
+
+// Whole-screen sway on beat-map tilts: the view rolls and slides toward each side, swinging smoothly between them
+// on a spring, and settles back to level once the tilts stop.
+const CAMERA = {
+  roll: 2.5 * Math.PI / 180, // how far the view rolls to a side
+  slide: 14,                 // px it slides sideways with the roll
+  hold: 0.5,                 // seconds a tilt keeps pulling before the view drifts back to level (one beat)
+  stiffness: 70,             // spring strength: higher swings over faster
+  slowStiffness: 1.5,        // for the very slow lean against a `tiltScreen` spinner's laser
+};
+const camera = { sway: 0, vel: 0, target: 0, hold: 0, stiffness: CAMERA.stiffness, beat: 0 }; // sway: -1 (left) .. 1 (right)
+const BEAT_NUDGE = { size: 0.2, time: 0.35 }; // every other beat: a small sway (fraction of a full one), over this long
+
+// every other beat the view nudges slightly to one side and eases back, alternating sides; `beats` = song position in beats
+function updateBeatNudge(beats) {
+  const cycle = Math.floor(beats / 2), since = (beats - cycle * 2) * (beatmap ? 60 / beatmap.bpm : 0.5);
+  const u = Math.min(1, since / BEAT_NUDGE.time);
+  camera.beat = Math.sin(Math.PI * u) ** 2 * BEAT_NUDGE.size * (cycle % 2 ? 1 : -1);
+}
+
+function updateCamera(dt) {
+  camera.hold -= dt;
+  if (camera.hold <= 0) camera.target = 0;
+  const damping = 2 * Math.sqrt(camera.stiffness); // critically damped: smooth, no wobble past the target
+  camera.vel += ((camera.target - camera.sway) * camera.stiffness - camera.vel * damping) * dt;
+  camera.sway += camera.vel * dt;
+}
+
+// rolls and slides the view about its center. A boss backdrop is drawn bigger than the view, so this only zooms in if
+// the roll would reach past the backdrop's hidden strip below the view (or past the edges when there's no backdrop).
+function applyCameraRoll() {
+  const sway = camera.sway + camera.beat;
+  if (Math.abs(sway) < 1e-4) return;
+  const a = Math.abs(sway) * CAMERA.roll, W = canvas.width, H = canvas.height;
+  const slide = sway * CAMERA.slide;
+  const reach = (H / 2) * Math.cos(a) + (W / 2) * Math.sin(a); // how far down the rolled view's corners reach
+  const zoom = fightBackdrop()
+    ? Math.max(1, reach / (H / 2 + FIGHT_BG.belowView))
+    : Math.cos(a) + (W / H) * Math.sin(a) + (2 * Math.abs(slide)) / W;
+  ctx.translate(W / 2 + slide, H / 2);
+  ctx.rotate(sway * CAMERA.roll);
+  ctx.scale(zoom, zoom);
+  ctx.translate(-W / 2, -H / 2);
+}
 const catImgs = {};
 for (const pose of ['idle', 'up', 'down']) {
   catImgs[pose] = new Image();
@@ -166,13 +227,141 @@ const CAT_MAX_TILT = 20 * Math.PI / 180; // lean at full horizontal speed (right
 const CAT_HITBOX = 0.43; // hitbox radius as a fraction of the size (the helmet fills ~86% of the image)
 
 const player = { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0, invuln: 0, r: CAT_SIZE * CAT_HITBOX, accel: 1600, friction: 6, maxSpeed: 320 };
-const boss = { x: BOSS_HOME_X, y: canvas.height / 2, rx: 60, ry: 110, color: '#d65db1', name: '', shakeT: 0, ceaseT: 0 };
+const boss = { x: BOSS_HOME_X, y: canvas.height / 2, rx: 60, ry: 110, color: '#d65db1', name: '', shakeT: 0, ceaseT: 0,
+  pulse: 0, rock: 0, squish: 0, homeX: BOSS_HOME_X };
 // placeholder names and colors, one per boss/song
 const BOSSES = [
-  { name: 'Sir Woofington', color: '#d65db1', song: 'assets/audio/pixel_pig.mp3' }, // Di Young - Pixel Pig
+  {
+    name: 'Pixel Pig', color: '#d65db1', song: 'assets/audio/pixel_pig.mp3', beatmap: 'pixel_pig', // Di Young - Pixel Pig
+    sprite: 'assets/pixel_pig.png', spriteBox: { cx: 93.5, cy: 124.5, h: 191 }, // visible part of the image: center + height
+    // two same-size layers: the sky drifts, the grass (transparent above it) stays put
+    background: { sky: 'assets/pixel_pig_sky.png', ground: 'assets/pixel_pig_grass.png' },
+    spectrum: 'pixel_pig', // audio visualizer data, made by tools/spectrum.py
+  },
   { name: 'Vacuum-9000', color: '#4f5bd5', locked: true },   // locked until a future update
   { name: 'Big Cucumber', color: '#e8a75d', locked: true },
 ];
+for (const b of BOSSES) {
+  if (b.sprite) b.img = Object.assign(new Image(), { src: b.sprite });
+  if (b.background) {
+    b.skyImg = Object.assign(new Image(), { src: b.background.sky });
+    b.groundImg = Object.assign(new Image(), { src: b.background.ground });
+  }
+}
+
+// The current boss's arena backdrop (plain cream if it has none): a sky that drifts right to left forever, with the
+// still ground layer over it. Both are tiled sideways and drawn bigger than the view, so the camera can roll and slide
+// around without showing an edge or needing to zoom in.
+const FIGHT_BG = {
+  scale: 0.42,      // image px -> canvas px (the 2500x1600 layers come out 1050x672)
+  belowView: 25,    // px of the layers hidden below the bottom edge (the rest of the extra height is above the view)
+  skySpeed: 15,     // px per second
+};
+let fightSkyScroll = 0;
+const layerPatterns = new Map(); // image -> { pattern, w, h } pre-scaled to whole pixels, so tiles never show seams
+const loaded = img => img && img.complete && img.naturalWidth;
+const fightBackdrop = () => {
+  const b = BOSSES[currentBoss];
+  return loaded(b.skyImg) || loaded(b.groundImg) ? b : null;
+};
+
+function layerPattern(img) {
+  let p = layerPatterns.get(img);
+  if (!p) {
+    const tile = document.createElement('canvas');
+    tile.width = Math.round(img.naturalWidth * FIGHT_BG.scale);
+    tile.height = Math.round(img.naturalHeight * FIGHT_BG.scale);
+    tile.getContext('2d').drawImage(img, 0, 0, tile.width, tile.height);
+    p = { pattern: ctx.createPattern(tile, 'repeat-x'), w: tile.width, h: tile.height };
+    layerPatterns.set(img, p);
+  }
+  return p;
+}
+
+// fills a band of repeated tiles, `offset` px scrolled, wide enough to cover a rolled and slid view
+function drawLayer(img, offset) {
+  const { pattern, w, h } = layerPattern(img);
+  const top = canvas.height + FIGHT_BG.belowView - h;
+  ctx.save();
+  ctx.translate(-(((offset % w) + w) % w) - w, top);
+  ctx.fillStyle = pattern;
+  ctx.fillRect(0, 0, canvas.width + 3 * w, h);
+  ctx.restore();
+}
+
+function drawFightBackground() {
+  const b = fightBackdrop();
+  if (!b) return;
+  if (loaded(b.skyImg)) drawLayer(b.skyImg, fightSkyScroll);
+  drawVisualizer(); // between the sky and the grass, so the grass hides the bars' feet
+  if (loaded(b.groundImg)) {
+    // centered, and still
+    drawLayer(b.groundImg, (layerPattern(b.groundImg).w - canvas.width) / 2);
+  }
+}
+
+// ---- audio visualizer: cava-style bars rising out of the grass, played back from the boss's pre-computed spectrum ----
+const VIS = {
+  baseY: 505,      // bars grow up from here (behind the grass)
+  maxH: 300,       // tallest bar, px
+  gap: 0.3,        // fraction of each bar slot left empty
+  overscan: 40,    // px past each side so the camera sway never shows the row ending
+  rise: 30,        // how quickly bars jump up to the music (per second, higher = snappier)
+  gravity: 2.2,    // how quickly bars fall back down (bar heights per second squared)
+};
+const vis = { levels: null, vel: null }; // current smoothed bar heights 0..1, and each bar's falling speed
+
+function spectrumFor(bossIndex) {
+  const b = BOSSES[bossIndex], raw = b.spectrum && window.SPECTRA?.[b.spectrum];
+  if (!raw) return null;
+  if (!raw.bytes) raw.bytes = Uint8Array.from(atob(raw.data), c => c.charCodeAt(0)); // decoded once
+  return raw;
+}
+
+function resetVisualizer() {
+  const spec = spectrumFor(currentBoss);
+  vis.levels = spec ? new Float32Array(spec.bands) : null;
+  vis.vel = spec ? new Float32Array(spec.bands) : null;
+}
+
+// bars jump up to the music quickly and fall back down with gravity, like cava
+function updateVisualizer(dt) {
+  const spec = spectrumFor(currentBoss);
+  if (!spec || !vis.levels) return;
+  const pos = Math.min(elapsed * spec.fps, spec.frames - 1.001);
+  const f = Math.max(0, Math.floor(pos)), u = pos - f;
+  for (let i = 0; i < spec.bands; i++) {
+    const a = spec.bytes[f * spec.bands + i], b = spec.bytes[(f + 1) * spec.bands + i];
+    const target = (a + (b - a) * u) / 255;
+    if (target >= vis.levels[i]) {
+      vis.levels[i] += (target - vis.levels[i]) * Math.min(1, VIS.rise * dt);
+      vis.vel[i] = 0;
+    } else {
+      vis.vel[i] += VIS.gravity * dt;
+      vis.levels[i] = Math.max(target, vis.levels[i] - vis.vel[i] * dt);
+    }
+  }
+}
+
+function drawVisualizer() {
+  const L = vis.levels;
+  if (!L) return;
+  const n = L.length, x0 = -VIS.overscan, slot = (canvas.width + 2 * VIS.overscan) / n;
+  const w = slot * (1 - VIS.gap);
+  const g = ctx.createLinearGradient(0, VIS.baseY - VIS.maxH, 0, VIS.baseY);
+  g.addColorStop(0, 'rgba(255, 255, 255, 0.6)');
+  g.addColorStop(1, 'rgba(190, 245, 225, 0.25)');
+  ctx.save();
+  ctx.fillStyle = g;
+  for (let i = 0; i < n; i++) {
+    // soften each bar with its neighbours so the row moves as a smooth wave
+    const v = (L[Math.max(0, i - 1)] + 2 * L[i] + L[Math.min(n - 1, i + 1)]) / 4;
+    const h = Math.max(4, v * VIS.maxH);
+    roundRectPath(x0 + i * slot + (slot - w) / 2, VIS.baseY - h, w, h + 20, Math.min(w / 2, 6));
+    ctx.fill();
+  }
+  ctx.restore();
+}
 
 const health = { hp: MAX_HP, regenTimer: 0 };
 let regen = null; // { t, angle } while a health point is about to reappear
@@ -207,6 +396,11 @@ addEventListener('keydown', e => {
 });
 addEventListener('keyup', e => keys.delete(e.code));
 
+// the song keeps playing in a background tab while the game loop stops, so pause the fight when the tab is hidden
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && scene === 'fight' && fightState === 'playing') fightState = 'paused';
+});
+
 let elapsed = 0;
 let fightState = 'playing'; // 'playing' | 'paused' | 'won' | 'lost'
 let endTimer = 0; // seconds since the fight ended
@@ -229,6 +423,30 @@ const bestStars = (() => {
 function saveStars() {
   try { localStorage.setItem(STARS_KEY, JSON.stringify(bestStars)); } catch (e) { /* ignore */ }
 }
+
+// saved objects: stored fields that are valid numbers override the defaults
+function loadNumbers(key, defaults) {
+  const out = { ...defaults };
+  try {
+    const saved = JSON.parse(localStorage.getItem(key));
+    for (const k in defaults) if (Number.isFinite(saved?.[k])) out[k] = saved[k];
+  } catch (e) { /* storage unavailable or corrupt: use defaults */ }
+  return out;
+}
+function saveJSON(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+}
+
+// lifetime records for the achievements page (time played counts only time spent actually fighting)
+const STATS_KEY = 'astrocat.stats';
+const stats = loadNumbers(STATS_KEY, { topCombo: 0, bestScore: 0, timePlayed: 0 });
+const saveStats = () => saveJSON(STATS_KEY, stats);
+addEventListener('pagehide', saveStats);
+
+// volumes, 0..1 (sound effects are saved now for when the game gets sounds)
+const SETTINGS_KEY = 'astrocat.settings';
+const settings = loadNumbers(SETTINGS_KEY, { music: 0.7, sfx: 0.7 });
+const saveSettings = () => saveJSON(SETTINGS_KEY, settings);
 let callout = null;    // { text, t } combo text on screen
 let typing = null;     // { chars, typed, t, errorT } the active prompt
 let promptTimer = 0;   // seconds until the next prompt appears
@@ -239,14 +457,15 @@ const overlayVisible = () => fightState === 'paused' || (fightEnded() && endTime
 
 // The fight's song: its playback position drives the progress bar, and finishing it is the win condition.
 let song = null; // Audio element while a fight is running
-const songLength = () => song && isFinite(song.duration) ? song.duration : FALLBACK_SONG_LENGTH;
+// (until the audio's length is known, the beat-map's copy of it keeps the progress bar and drop diamonds in place)
+const songLength = () => song && isFinite(song.duration) ? song.duration : song && beatmap ? beatmap.duration : FALLBACK_SONG_LENGTH;
 
 function startSong(path) {
   if (song) song.pause();
   song = null;
   if (!path) return;
   const s = new Audio(path);
-  s.volume = MUSIC_VOLUME;
+  s.volume = settings.music;
   s.addEventListener('error', () => { if (song === s) song = null; }); // fall back to the timer if it can't load
   song = s;
   s.play().catch(() => {});
@@ -256,6 +475,7 @@ function startSong(path) {
 function syncMusic() {
   if (!song) return;
   if (scene !== 'fight') { song.pause(); song = null; return; }
+  song.volume = settings.music;
   const shouldPlay = fightState === 'playing';
   if (shouldPlay && song.paused && !song.ended) song.play().catch(() => {});
   else if (!shouldPlay && !song.paused) song.pause();
@@ -264,7 +484,11 @@ function syncMusic() {
 function startFight(bossIndex) {
   currentBoss = bossIndex;
   startSong(BOSSES[bossIndex].song);
-  Object.assign(boss, { x: BOSS_HOME_X, color: BOSSES[bossIndex].color, name: BOSSES[bossIndex].name });
+  beatmap = window.BEATMAPS?.[BOSSES[bossIndex].beatmap] ?? null;
+  beatQueue = beatmap ? [...beatmap.events].sort((a, b) => (a.t - windup(a)) - (b.t - windup(b))) : [];
+  nextEvent = 0;
+  const def = BOSSES[bossIndex];
+  Object.assign(boss, { x: BOSS_HOME_X, homeX: BOSS_HOME_X, color: def.color, name: def.name, img: def.img ?? null, box: def.spriteBox });
   fightState = 'playing';
   endTimer = 0;
   score = 0;
@@ -275,7 +499,8 @@ function startFight(bossIndex) {
   sparks.length = 0;
   spinner = null;
   attackTimer = 0;
-  Object.assign(boss, { shakeT: 0, ceaseT: 0 });
+  Object.assign(boss, { shakeT: 0, ceaseT: 0, pulse: 0 });
+  Object.assign(camera, { sway: 0, vel: 0, target: 0, hold: 0, stiffness: CAMERA.stiffness, beat: 0 });
   combo = 0;
   maxCombo = 0;
   gotHit = false;
@@ -289,6 +514,7 @@ function startFight(bossIndex) {
   Object.assign(health, { hp: MAX_HP, regenTimer: 0 });
   resetOrbs();
   elapsed = 0;
+  resetVisualizer();
   scene = 'fight';
 }
 
@@ -302,6 +528,9 @@ function endFight(result) {
     bestStars[currentBoss] = tier;
     saveStars();
   }
+  stats.topCombo = Math.max(stats.topCombo, maxCombo);
+  stats.bestScore = Math.max(stats.bestScore, score);
+  saveStats();
   fightState = result;
   endTimer = 0;
   regen = null;
@@ -344,8 +573,49 @@ function completePrompt() {
 }
 
 // ---- boss attacks ----
-function fireShot(x, y, vx, vy) {
-  shots.push({ x, y, vx, vy });
+// `thrown` = thrown by the boss (fast start, curves toward the player); `falls` = from a bomb burst (steady speed,
+// pulled slowly down by gravity). Nothing else curves or falls.
+function fireShot(x, y, vx, vy, { thrown = false, falls = false } = {}) {
+  shots.push({ x, y, vx, vy, trail: [], thrown, falls, age: 0 });
+}
+
+function steerThrownShot(s, dt) {
+  s.age += dt;
+  const speed = SHOT.cruiseSpeed + (SHOT.launchSpeed - SHOT.cruiseSpeed) * Math.exp(-s.age / SHOT.easeTime);
+  let heading = Math.atan2(s.vy, s.vx);
+  if (fightState === 'playing') {
+    // turn a little toward the cat, but only while it's still ahead (so balls never boomerang back)
+    let diff = Math.atan2(player.y - s.y, player.x - s.x) - heading;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    if (Math.abs(diff) < Math.PI / 2) heading += Math.max(-SHOT.curve * dt, Math.min(SHOT.curve * dt, diff));
+  }
+  s.vx = Math.cos(heading) * speed;
+  s.vy = Math.sin(heading) * speed;
+}
+
+// mud trails: each ball remembers where it was for the last TRAIL_TIME seconds and drags a fading smear behind it
+const TRAIL_TIME = 0.28; // about 80px behind a normal shot
+function recordTrail(o, dt) {
+  for (const p of o.trail) p.age += dt;
+  while (o.trail.length && o.trail[0].age > TRAIL_TIME) o.trail.shift();
+  o.trail.push({ x: o.x, y: o.y, age: 0 });
+}
+function drawTrail(o, r) {
+  const pts = o.trail;
+  if (pts.length < 2) return;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = MUD.mid;
+  for (let i = 1; i < pts.length; i++) {
+    const u = 1 - pts[i].age / TRAIL_TIME; // 1 at the ball, 0 at the tail end
+    ctx.globalAlpha = 0.65 * u;
+    ctx.lineWidth = Math.max(1, 1.7 * r * u);
+    ctx.beginPath();
+    ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+    ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 // out of the boss's center, heading left, tilted by `degrees` (0 = horizontal, + = up, - = down)
@@ -354,7 +624,7 @@ const SHOOT_STEP = 15, SHOOT_MAX = 75;
 function shoot(degrees = 0) {
   const snapped = Math.max(-SHOOT_MAX, Math.min(SHOOT_MAX, Math.round(degrees / SHOOT_STEP) * SHOOT_STEP));
   const rad = snapped * Math.PI / 180;
-  fireShot(boss.x, boss.y, -Math.cos(rad) * SHOT.speed, -Math.sin(rad) * SHOT.speed);
+  fireShot(boss.x, boss.y, -Math.cos(rad) * SHOT.speed, -Math.sin(rad) * SHOT.speed, { thrown: true });
 }
 const shootRandomAngle = () => shoot((Math.floor(Math.random() * (2 * SHOOT_MAX / SHOOT_STEP + 1)) - SHOOT_MAX / SHOOT_STEP) * SHOOT_STEP);
 
@@ -376,7 +646,7 @@ function spawnBeamSparks(b) {
       vy: (Math.random() - 0.5) * 80,
       age: 0, life: 0.8 + Math.random() * 0.6,
       size: 3 + Math.random() * 4,
-      color: Math.random() < 0.5 ? COLOR.purple : COLOR.orb,
+      color: Math.random() < 0.5 ? MUD.mid : MUD.light,
     });
   }
 }
@@ -407,20 +677,27 @@ function throwBomb() {
   // so it can never reach an edge (no bouncing, no clamping)
   const dist = Math.min(toWall, BOMB.minDist + Math.random() * (toWall - BOMB.minDist));
   const speed = dist * BOMB.drag;
-  bombs.push({ x: boss.x, y: boss.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, t: 0, phase: 0 });
+  bombs.push({ x: boss.x, y: boss.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, t: 0, phase: 0, angle, trail: [] });
 }
 
 // bursts into projectiles in all 8 compass directions
 function explodeBomb(b) {
   for (let k = 0; k < 8; k++) {
     const a = k * Math.PI / 4;
-    fireShot(b.x, b.y, Math.cos(a) * BOMB.blastSpeed, Math.sin(a) * BOMB.blastSpeed);
+    fireShot(b.x, b.y, Math.cos(a) * BOMB.blastSpeed, Math.sin(a) * BOMB.blastSpeed, { falls: true });
   }
 }
 
 // throws the spinner to a random spot at least SPINNER.margin from the borders (skips if one is already out)
-function launchSpinner() {
+// optional: `dur` = laser seconds, `rev` = seconds into the laser when it reverses direction (a number, or a list to
+// reverse several times), `spin` = radians/sec, `tiltScreen` = the screen leans very slowly against the laser's turn,
+// `aim` = degrees: start that far to one side of the player and sweep toward them (default: start pointing away),
+// `doubleSided` = the laser shoots out both sides of the orb
+function launchSpinner({
+  dur = SPINNER.laser, rev = [], spin = SPINNER.spin, tiltScreen = false, aim = null, doubleSided = false,
+} = {}) {
   if (spinner) return;
+  rev = [].concat(rev ?? []).sort((a, b) => a - b);
   const m = SPINNER.margin;
   const top = BAR.y + BAR.capH + m;
   const tx = m + Math.random() * (BOSS_HOME_X - boss.rx - 2 * m);
@@ -431,7 +708,7 @@ function launchSpinner() {
   spinner = {
     x: boss.x, y: boss.y, vx: (dx / dist) * speed, vy: (dy / dist) * speed,
     t: 0, phase: 0, firing: false, angle0: 0, angle: 0,
-    dir: Math.random() < 0.5 ? 1 : -1, cool: 0,
+    dir: Math.random() < 0.5 ? 1 : -1, cool: 0, dur, rev, spin, tiltScreen, aim, doubleSided,
   };
 }
 
@@ -456,18 +733,38 @@ function updateSpinner(dt) {
   }
 
   if (!s.firing) {
-    // laser starts somewhere the player isn't, and sweeps toward where they were
+    // laser starts pointing directly away from the player (give or take SPINNER.startSpread; a double-sided one
+    // starts crosswise instead, so neither end is on them), or, with `aim`, that many degrees beside the player,
+    // turning toward them
     s.firing = true;
     s.vx = s.vy = 0;
     const toPlayer = Math.atan2(player.y - s.y, player.x - s.x);
-    s.angle0 = toPlayer - s.dir * (0.9 + Math.random() * (Math.PI - 0.9));
+    const spread = (Math.random() * 2 - 1) * SPINNER.startSpread;
+    s.angle0 = s.aim !== null ? toPlayer - s.dir * (s.aim * Math.PI / 180)
+      : s.doubleSided ? toPlayer + Math.PI / 2 + spread
+      : toPlayer + Math.PI + spread;
   }
   const lt = s.t - SPINNER.fuse;
-  if (lt >= SPINNER.laser) {
+  if (lt >= s.dur) {
     spinner = null;
     return;
   }
-  s.angle = s.angle0 + s.dir * SPINNER.spin * lt;
+  // sweeps one way, and at each reverse point swings back the way it came
+  let swept = 0, sign = 1, from = 0;
+  for (const r of s.rev) {
+    if (lt <= r) break;
+    swept += sign * (r - from);
+    sign = -sign;
+    from = r;
+  }
+  swept += sign * (lt - from);
+  s.angle = s.angle0 + s.dir * s.spin * swept;
+  if (s.tiltScreen) {
+    // lean the opposite way to the laser's turn (positive = clockwise), flipping each time it reverses
+    camera.target = -s.dir * sign;
+    camera.hold = 0.1; // released shortly after the laser ends, then eases back to level just as slowly
+    camera.stiffness = CAMERA.slowStiffness;
+  }
   if (canHit() && lt >= SPINNER.fadeIn && s.cool <= 0 && laserHitsPlayer(s)) {
     damagePlayer();
     s.cool = SPINNER.hitCooldown;
@@ -475,14 +772,55 @@ function updateSpinner(dt) {
 }
 
 // player circle vs the laser segment
+// player circle vs the laser (a segment out from the orb, or through it both ways when double-sided)
 function laserHitsPlayer(s) {
   const ex = Math.cos(s.angle) * SPINNER.length, ey = Math.sin(s.angle) * SPINNER.length;
   const px = player.x - s.x, py = player.y - s.y;
-  const t = Math.max(0, Math.min(1, (px * ex + py * ey) / (ex * ex + ey * ey)));
+  const t = Math.max(s.doubleSided ? -1 : 0, Math.min(1, (px * ex + py * ey) / (ex * ex + ey * ey)));
   return Math.hypot(px - ex * t, py - ey * t) < player.r + SPINNER.width / 2;
 }
 
 const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb, launchSpinner];
+
+// ---- beat-map: attacks placed on the song's beats (generated by tools/beatmap.py) ----
+// Each event's `t` is when the attack lands (a beam fires, a bomb bursts, a spinner's laser starts), so attacks with
+// a wind-up are started that much earlier to hit on the beat.
+const laneX = x => x === undefined ? undefined : 40 + x * (BOSS_HOME_X - boss.rx - 80);
+const BEAT_ATTACKS = {
+  shoot: e => shoot(e.deg ?? 0),
+  fan: e => {
+    for (let d = Math.min(e.from, e.to); d <= Math.max(e.from, e.to); d += SHOOT_STEP) shoot(d);
+  },
+  beamUp: e => shootUp(laneX(e.x)),
+  beamDown: e => shootDown(laneX(e.x)),
+  bomb: () => throwBomb(),
+  spinner: e => launchSpinner({
+    dur: e.dur, rev: e.rev, spin: e.spin, tiltScreen: e.tiltScreen, aim: e.aim, doubleSided: e.doubleSided,
+  }),
+  // boss movement cues (not attacks)
+  tilt: e => { camera.target = e.dir; camera.hold = CAMERA.hold; camera.stiffness = CAMERA.stiffness; }, // screen sways
+  pulse: e => { boss.pulse = Math.max(boss.pulse, e.power ?? 1); },
+};
+const MOTION_EVENTS = new Set(['tilt', 'pulse']); // not attacks: still happen while the boss is stunned
+const windup = e => ({ beamUp: BEAM.charge, beamDown: BEAM.charge, bomb: BOMB.fuse, spinner: SPINNER.fuse })[e.a] ?? 0;
+const STALE_EVENT = 0.25; // seconds late before an event is dropped (e.g. after the tab was in the background)
+
+let beatmap = null;  // the current boss's beat-map, if it has one
+let beatQueue = [];  // its events ordered by when they have to START (landing time minus wind-up)
+let nextEvent = 0;   // index of the next event to start
+
+function runBeatmap() {
+  const events = beatQueue;
+  while (nextEvent < events.length && events[nextEvent].t - windup(events[nextEvent]) <= elapsed) {
+    const e = events[nextEvent++];
+    const late = elapsed - (e.t - windup(e));
+    if (late > STALE_EVENT || (boss.ceaseT > 0 && !MOTION_EVENTS.has(e.a))) continue; // stunned boss holds fire
+    BEAT_ATTACKS[e.a]?.(e);
+  }
+}
+
+// the build-up before a drop the song is currently in, if any
+const currentDrop = () => beatmap?.drops.find(d => elapsed >= d.build && elapsed < d.drop) ?? null;
 
 // hits only land while playing and not already invulnerable from the last hit
 const canHit = () => fightState === 'playing' && player.invuln <= 0;
@@ -557,6 +895,7 @@ function drawComboBreak() {
 function updateFight(dt) {
   const playing = fightState === 'playing';
   if (playing) {
+    stats.timePlayed += dt;
     // the song's own clock, or a plain timer when there's no song
     elapsed = Math.min(song ? song.currentTime : elapsed + dt, songLength());
     if (song ? song.ended : elapsed >= songLength()) {
@@ -566,9 +905,23 @@ function updateFight(dt) {
   } else {
     endTimer += dt;
   }
+  updateVisualizer(dt);
 
   // win: the boss flees off the right edge
-  if (fightState === 'won') boss.x += 800 * endTimer * dt;
+  if (fightState === 'won') boss.homeX += 800 * endTimer * dt;
+
+  // in time with the music (and still while it flees): floats up and down every two beats, and rocks side to side,
+  // leaning fully one way on each beat and the other way on the next. Attacks come from where it is.
+  const beat = beatmap ? 60 / beatmap.bpm : 0.5;
+  const beats = (elapsed + endTimer - (beatmap?.offset ?? 0)) / beat;
+  boss.x = boss.homeX + Math.sin((Math.PI * beats) / 2) * BOSS_DRIFT;
+  boss.y = BOSS_HOME_Y + Math.sin(Math.PI * beats) * BOSS_BOB;
+  boss.rock = Math.cos(Math.PI * beats) * BOSS_ROCK;
+  boss.squish = Math.cos(2 * Math.PI * beats) * BOSS_SQUISH; // + = wide and short, on each beat
+  updateBeatNudge(beats);
+
+  updateCamera(dt);
+  boss.pulse *= Math.exp(-9 * dt); // kick bounces fade out
 
   boss.shakeT = Math.max(0, boss.shakeT - dt);
   boss.ceaseT = Math.max(0, boss.ceaseT - dt);
@@ -595,8 +948,9 @@ function updateFight(dt) {
     }
   }
 
-  // attacks: pick a random one on a timer (held while the boss is stunned)
-  if (playing && boss.ceaseT <= 0) {
+  // attacks: follow the song's beat-map, or pick a random one on a timer for bosses without one
+  if (playing && beatmap) runBeatmap();
+  else if (playing && boss.ceaseT <= 0) {
     attackTimer += dt;
     if (attackTimer >= SHOT.interval) {
       attackTimer = 0;
@@ -613,6 +967,8 @@ function updateFight(dt) {
     b.vx *= drag; b.vy *= drag;
     b.x += b.vx * dt;
     b.y += b.vy * dt;
+    if (Math.hypot(b.vx, b.vy) > 5) b.angle = Math.atan2(b.vy, b.vx); // keeps the last heading once it stops
+    recordTrail(b, dt); // the trail shrinks away on its own as the bomb skids to a stop
     const urgency = b.t / BOMB.fuse;
     b.phase += (2 + 16 * urgency * urgency) * dt; // flashes per second, ramping up
     if (b.t >= BOMB.fuse) {
@@ -650,8 +1006,11 @@ function updateFight(dt) {
   const margin = SHOT.r * 2;
   for (let i = shots.length - 1; i >= 0; i--) {
     const s = shots[i];
+    if (s.thrown) steerThrownShot(s, dt);
+    if (s.falls) s.vy += BOMB.gravity * dt;
     s.x += s.vx * dt;
     s.y += s.vy * dt;
+    recordTrail(s, dt);
     if (canHit() && Math.hypot(s.x - player.x, s.y - player.y) < SHOT.r + player.r) {
       damagePlayer();
       shots.splice(i, 1);
@@ -838,52 +1197,98 @@ function drawRegenBurst() {
   ctx.lineCap = 'butt';
 }
 
-function drawFight() {
-  // progress bar (top): |-------■------|
-  const midY = BAR.y;
-  ctx.strokeStyle = COLOR.track;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(BAR.x, midY - BAR.capH / 2); ctx.lineTo(BAR.x, midY + BAR.capH / 2);
-  ctx.moveTo(BAR.x + BAR.w, midY - BAR.capH / 2); ctx.lineTo(BAR.x + BAR.w, midY + BAR.capH / 2);
-  ctx.moveTo(BAR.x, midY); ctx.lineTo(BAR.x + BAR.w, midY);
-  ctx.stroke();
-  const markX = BAR.x + BAR.w * (elapsed / songLength());
-  ctx.fillStyle = COLOR.purple;
-  ctx.fillRect(markX - 5, midY - 5, 10, 10);
+// Draws the boss's sprite with its visible part `h` tall, centered on (x, y); `flash` overlays a white silhouette.
+// Returns false when the boss has no (loaded) sprite, so the caller can draw the placeholder oval.
+const BOSS_SPRITE_H = 230;
+const bossFlashCanvas = document.createElement('canvas');
+const drawBossSprite = (x, y, h, flash = false) => drawSprite(boss.img, boss.box, x, y, h, flash);
+function drawSprite(img, box, x, y, h, flash = false) {
+  if (!(img && img.complete && img.naturalWidth)) return false;
+  const s = h / box.h, w = img.naturalWidth * s, fullH = img.naturalHeight * s;
+  const dx = x - box.cx * s, dy = y - box.cy * s;
+  ctx.drawImage(img, dx, dy, w, fullH);
+  if (flash) {
+    const c = bossFlashCanvas, cc = c.getContext('2d');
+    c.width = Math.ceil(w);
+    c.height = Math.ceil(fullH);
+    cc.drawImage(img, 0, 0, w, fullH);
+    cc.globalCompositeOperation = 'source-atop';
+    cc.fillStyle = COLOR.white;
+    cc.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(c, dx, dy);
+  }
+  return true;
+}
 
+// DEBUG: song time next to the top progress bar, as m:ss.ss / total (turn off with DEBUG_TIME = false)
+const DEBUG_TIME = true;
+const DEBUG_KEYS = true; // Y = spawn a spinner
+const clock = t => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+function drawDebugTime() {
+  if (!DEBUG_TIME) return;
+  ctx.font = 'bold 14px Fredoka, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = COLOR.muted;
+  ctx.fillText(`${clock(elapsed)} / ${clock(songLength())}`, BAR.x + BAR.w + 14, BAR.y);
+}
+
+// the song progress bar: |-------■------| with the drop diamonds; `scale` sizes the caps, diamonds and marker
+function drawProgressBar(x, y, w, scale) {
+  const capH = BAR.capH * scale;
+  ctx.strokeStyle = COLOR.track;
+  ctx.lineWidth = 2 * scale;
+  ctx.beginPath();
+  ctx.moveTo(x, y - capH / 2); ctx.lineTo(x, y + capH / 2);
+  ctx.moveTo(x + w, y - capH / 2); ctx.lineTo(x + w, y + capH / 2);
+  ctx.moveTo(x, y); ctx.lineTo(x + w, y);
+  ctx.stroke();
+  drawDropMarkers(x, y, w, 5 * scale);
+  const m = 5 * scale, markX = x + w * (elapsed / songLength());
+  ctx.fillStyle = COLOR.purple;
+  ctx.fillRect(markX - m, y - m, m * 2, m * 2);
+}
+
+// the arena: everything that shakes and rolls with the camera
+function drawFight() {
   drawBeams();
   drawSpinner();
 
-  // bombs: black, flashing red (drawn before the boss so they emerge from behind it)
-  for (const b of bombs) {
-    const glow = (Math.sin(b.phase * Math.PI * 2) + 1) / 2;
-    ctx.fillStyle = `rgb(${Math.round(20 + 235 * glow)}, 20, 20)`;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, BOMB.r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = COLOR.lavender; // light rim so the black bomb reads on the dark backdrop
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  }
+  // bombs: mud balls flashing red faster and faster (drawn before the boss so they emerge from behind it)
+  for (const b of bombs) drawTrail(b, BOMB.r);
+  for (const b of bombs) drawMudBall(b.x, b.y, BOMB.r, b.angle, (Math.sin(b.phase * Math.PI * 2) + 1) / 2);
 
-  // projectiles
-  ctx.fillStyle = COLOR.white;
-  ctx.strokeStyle = COLOR.ink;
-  ctx.lineWidth = 3;
-  for (const s of shots) {
-    ctx.beginPath();
-    ctx.arc(s.x, s.y, SHOT.r, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-  }
+  // projectiles: mud balls, trail streaming behind them
+  for (const s of shots) drawTrail(s, SHOT.r);
+  for (const s of shots) drawMudBall(s.x, s.y, SHOT.r, Math.atan2(s.vy, s.vx));
 
-  // boss (shakes and flashes white when a prompt lands)
+  // boss (shakes and flashes white when a prompt lands; trembles and glows while charging up for a drop)
   const hit = boss.shakeT > 0;
-  ctx.fillStyle = hit && Math.floor(boss.shakeT * 20) % 2 === 0 ? COLOR.white : boss.color;
-  ctx.beginPath();
-  ctx.ellipse(boss.x + (hit ? Math.sin(boss.shakeT * 90) * 8 : 0), boss.y, boss.rx, boss.ry, 0, 0, Math.PI * 2);
-  ctx.fill();
+  const drop = fightState === 'playing' ? currentDrop() : null;
+  const charge = drop && elapsed >= drop.break ? (elapsed - drop.break) / (drop.drop - drop.break) : 0;
+  let bossX = boss.x + (hit ? Math.sin(boss.shakeT * 90) * 8 : 0), bossY = boss.y;
+  if (charge > 0) {
+    bossX += (Math.random() * 2 - 1) * (1 + 5 * charge);
+    bossY += (Math.random() * 2 - 1) * (1 + 5 * charge);
+  }
+  ctx.save();
+  if (charge > 0) {
+    ctx.shadowColor = COLOR.white;
+    ctx.shadowBlur = 10 + 40 * charge;
+  }
+  const flash = hit && Math.floor(boss.shakeT * 20) % 2 === 0;
+  // beat rocking, plus a hop + swell on bass kicks, about the boss's center
+  ctx.translate(bossX, bossY - BOSS_HOP * boss.pulse);
+  ctx.rotate(boss.rock);
+  ctx.scale((1 + 0.05 * boss.pulse) * (1 + boss.squish), (1 + 0.05 * boss.pulse) * (1 - boss.squish));
+  bossX = bossY = 0;
+  if (!drawBossSprite(bossX, bossY, BOSS_SPRITE_H, flash)) {
+    ctx.fillStyle = flash ? COLOR.white : boss.color;
+    ctx.beginPath();
+    ctx.ellipse(bossX, bossY, boss.rx, boss.ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
 
   // player (hitbox is a circle of radius player.r fitted to the sprite)
   // thrusters follow the vertical keys: W = up sprite, S = down sprite, otherwise idle
@@ -918,10 +1323,79 @@ function drawFight() {
   // health orbs
   for (let i = 0; i < health.hp; i++) drawHeart(orbs[i].x, orbs[i].y, ORBIT.r);
   if (regen) drawRegenBurst();
+}
 
+// the HUD stays steady on top of the arena
+function drawFightHud() {
+  drawProgressBar(BAR.x, BAR.y, BAR.w, 1); // |-------■------|
+  drawDebugTime();
   drawHud();
   if (callout) drawCallout();
   if (typing) drawPrompt();
+}
+
+// drops on a progress line: the build-up is a brighter stretch of the line ending in a diamond right at the drop.
+// Diamonds are hollow until the song reaches them, then fill in.
+function drawDropMarkers(x, y, w, size) {
+  if (!beatmap) return;
+  const len = songLength();
+  ctx.save();
+  for (const d of beatmap.drops) {
+    const x0 = x + w * Math.min(1, d.build / len), x1 = x + w * Math.min(1, d.drop / len);
+    ctx.strokeStyle = UI.soft;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(x0, y); ctx.lineTo(x1, y);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(x1, y - size); ctx.lineTo(x1 + size, y); ctx.lineTo(x1, y + size); ctx.lineTo(x1 - size, y);
+    ctx.closePath();
+    ctx.fillStyle = elapsed >= d.drop ? UI.pink : COLOR.white;
+    ctx.fill();
+    ctx.strokeStyle = COLOR.ink;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// mud ball sprite: its round body is `r` (hitbox radius) across the middle, turned to face `heading` (its trail is drawn
+// separately, see drawTrail);
+// `red` (0..1) washes it red, for bombs about to burst. Falls back to a plain brown circle until the image loads.
+const mudImg = Object.assign(new Image(), { src: 'assets/mud_ball.png' });
+const MUD_BALL = { cx: 65.5, cy: 61, d: 78 }; // where the ball sits in the 128x128 image
+const MUD_BALL_SIZE = 1.15; // body drawn slightly bigger than the hitbox since its edge is soft
+let mudRed = null;           // red-tinted copy of the sprite, made once
+function drawMudBall(x, y, r, heading = Math.PI, red = 0) {
+  if (!(mudImg.complete && mudImg.naturalWidth)) {
+    ctx.fillStyle = MUD.mid;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+  if (!mudRed) {
+    mudRed = document.createElement('canvas');
+    mudRed.width = mudImg.naturalWidth;
+    mudRed.height = mudImg.naturalHeight;
+    const c = mudRed.getContext('2d');
+    c.drawImage(mudImg, 0, 0);
+    c.globalCompositeOperation = 'source-atop';
+    c.fillStyle = '#ff2a1a';
+    c.fillRect(0, 0, mudRed.width, mudRed.height);
+  }
+  const s = (2 * r * MUD_BALL_SIZE) / MUD_BALL.d;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(heading);
+  ctx.scale(s, s);
+  ctx.drawImage(mudImg, -MUD_BALL.cx, -MUD_BALL.cy);
+  if (red > 0) {
+    ctx.globalAlpha = red * 0.85;
+    ctx.drawImage(mudRed, -MUD_BALL.cx, -MUD_BALL.cy);
+  }
+  ctx.restore();
 }
 
 function drawBeams() {
@@ -931,25 +1405,25 @@ function drawBeams() {
     if (b.t < BEAM.charge) {
       // warning: dashed outline of the column, filling in and pulsing faster as it charges
       const p = b.t / BEAM.charge;
-      ctx.fillStyle = COLOR.purple;
-      ctx.globalAlpha = 0.04 + 0.1 * p;
+      ctx.fillStyle = MUD.mid;
+      ctx.globalAlpha = 0.06 + 0.12 * p;
       ctx.fillRect(x0, 0, BEAM.w, H);
       ctx.globalAlpha = 0.5 + 0.4 * Math.sin(b.t * (10 + 20 * p));
-      ctx.strokeStyle = COLOR.purple;
+      ctx.strokeStyle = MUD.deep;
       ctx.lineWidth = 2;
       ctx.setLineDash([12, 8]);
       ctx.strokeRect(x0, 1, BEAM.w, H - 2);
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
     } else {
-      // live beam: purple edges, lavender core, swept across the column almost instantly
+      // live beam: dark mud edges, lighter core, swept across the column almost instantly
       const p = Math.min(1, (b.t - BEAM.charge) / BEAM.sweep);
       const g = ctx.createLinearGradient(x0, 0, x0 + BEAM.w, 0);
-      g.addColorStop(0, COLOR.purple);
-      g.addColorStop(0.5, COLOR.lavender);
-      g.addColorStop(1, COLOR.purple);
+      g.addColorStop(0, MUD.deep);
+      g.addColorStop(0.5, MUD.pale);
+      g.addColorStop(1, MUD.deep);
       ctx.save();
-      ctx.shadowColor = COLOR.purple;
+      ctx.shadowColor = MUD.mid;
       ctx.shadowBlur = 20;
       ctx.fillStyle = g;
       ctx.fillRect(x0, b.dir === 1 ? 0 : H * (1 - p), BEAM.w, H * p);
@@ -972,31 +1446,31 @@ function drawSpinner() {
   const lt = s.t - SPINNER.fuse;
 
   if (lt >= 0) {
-    // spinning laser: purple edges, lavender core, fades in
+    // spinning laser: dark mud edges, lighter core, fades in
     const W = SPINNER.width;
     const g = ctx.createLinearGradient(0, -W / 2, 0, W / 2);
-    g.addColorStop(0, COLOR.purple);
-    g.addColorStop(0.5, COLOR.lavender);
-    g.addColorStop(1, COLOR.purple);
+    g.addColorStop(0, MUD.deep);
+    g.addColorStop(0.5, MUD.pale);
+    g.addColorStop(1, MUD.deep);
     ctx.save();
     ctx.translate(s.x, s.y);
     ctx.rotate(s.angle);
     ctx.globalAlpha = Math.min(1, lt / SPINNER.fadeIn);
-    ctx.shadowColor = COLOR.purple;
+    ctx.shadowColor = MUD.mid;
     ctx.shadowBlur = 20;
     ctx.fillStyle = g;
-    ctx.fillRect(0, -W / 2, SPINNER.length, W);
+    ctx.fillRect(s.doubleSided ? -SPINNER.length : 0, -W / 2, SPINNER.length * (s.doubleSided ? 2 : 1), W);
     ctx.restore();
   }
 
-  // purple orb with a white center that flashes red (solid red once the laser is out)
+  // mud orb with a white center that flashes red (solid red once the laser is out)
   const glow = lt >= 0 ? 1 : (Math.sin(s.phase * Math.PI * 2) + 1) / 2;
   const gb = Math.round(255 * (1 - glow));
-  ctx.fillStyle = COLOR.purple;
+  ctx.fillStyle = MUD.mid;
   ctx.beginPath();
   ctx.arc(s.x, s.y, SPINNER.r, 0, Math.PI * 2);
   ctx.fill();
-  ctx.strokeStyle = COLOR.lavender; // light rim so it stands out from the purple planets
+  ctx.strokeStyle = MUD.dark;
   ctx.lineWidth = 3;
   ctx.stroke();
   ctx.fillStyle = `rgb(255, ${gb}, ${gb})`;
@@ -1009,10 +1483,10 @@ function drawHud() {
   ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
   ctx.font = 'bold 24px Fredoka, sans-serif';
-  ctx.fillStyle = COLOR.white;
+  ctx.fillStyle = COLOR.ink;
   ctx.fillText(`Points ${score}`, 24, 20);
   if (combo > 0) {
-    ctx.fillStyle = COLOR.orb;
+    ctx.fillStyle = COLOR.purple;
     ctx.fillText(`Combo x${combo}`, 24, 52);
   }
   if (comboBreakFx) drawComboBreak();
@@ -1074,7 +1548,56 @@ let scene = 'title';
 let sel = 0; // selected banner on the select screen
 const mouse = { x: -1, y: -1 };
 
-const PLAY_BTN = { w: 220, h: 64, x: (canvas.width - 220) / 2, y: 330 };
+// settings / achievements pages open on top of whatever screen is showing (so the paused fight stays paused underneath)
+let page = null; // null | 'settings' | 'achievements'
+
+// ---- round icon buttons: a big middle button with 15% smaller ones on either side ----
+const iconImg = src => Object.assign(new Image(), { src });
+const ICONS = {
+  play: iconImg('assets/play.png'),
+  settings: iconImg('assets/settings.png'),
+  achievements: iconImg('assets/achievements.png'),
+  lobby: iconImg('assets/lobby.png'),
+  back: iconImg('assets/back.png'),
+};
+const ICON_CIRCLE = { cx: 446.5, cy: 434, d: 674 }; // where the drawn circle sits inside each 900x900 icon image
+const SIDE_SCALE = 0.85;
+
+// a centered row of round buttons; `specs` are { icon, big, action }, laid out left to right
+function roundButtonRow(cy, bigD, gap, specs) {
+  const ds = specs.map(s => (s.big ? bigD : bigD * SIDE_SCALE));
+  let x = canvas.width / 2 - (ds.reduce((a, b) => a + b, 0) + gap * (specs.length - 1)) / 2;
+  return specs.map((s, i) => {
+    const b = { ...s, d: ds[i], x: x + ds[i] / 2, y: cy, grow: 0 };
+    x += ds[i] + gap;
+    return b;
+  });
+}
+const roundButtonAt = (list, p) => list.find(b => Math.hypot(p.x - b.x, p.y - b.y) <= b.d / 2);
+
+// buttons ease up in size while hovered
+// (`active` = false while an on-top page covers these buttons)
+function updateRoundButtons(list, dt, active = !page) {
+  const hovered = active ? roundButtonAt(list, mouse) : null;
+  const k = 1 - Math.exp(-16 * dt);
+  for (const b of list) b.grow += ((b === hovered ? 1 : 0) - b.grow) * k;
+}
+
+function drawRoundButton(b) {
+  const img = ICONS[b.icon];
+  const grow = 1 + 0.08 * b.grow;
+  // scale the image so its circle is b.d across and centered on the button
+  const s = (b.d / ICON_CIRCLE.d) * grow;
+  if (img.complete && img.naturalWidth) {
+    ctx.drawImage(img, b.x - ICON_CIRCLE.cx * s, b.y - ICON_CIRCLE.cy * s, img.naturalWidth * s, img.naturalHeight * s);
+  }
+}
+
+const TITLE_BUTTONS = roundButtonRow(390, 130, 30, [
+  { icon: 'settings', action: () => { page = 'settings'; } },
+  { icon: 'play', big: true, action: () => { scene = 'select'; } },
+  { icon: 'achievements', action: () => { page = 'achievements'; } },
+]);
 const BANNER = { w: 200, h: 320, gap: 60, y: 110, point: 0.72 }; // point: where the bottom taper starts
 // boss 1 is centered; bosses 2 and 3 flank it on the left and right, a little higher
 const BANNER_SLOTS = [
@@ -1114,11 +1637,19 @@ function stepSel(dir) {
     if (!BOSSES[i].locked) { sel = i; return; }
   }
 }
-const playHovered = () => inRect(PLAY_BTN, mouse);
 
 function onKey(code) {
   const confirm = code === 'Enter' || code === 'Space';
-  if (scene === 'title') {
+  if (page === 'settings') {
+    if (code === 'KeyW' || code === 'KeyS') selSlider = (selSlider + 1) % SLIDERS.length;
+    else if (code === 'KeyA' || code === 'KeyD') {
+      const k = SLIDERS[selSlider].key;
+      settings[k] = Math.round(Math.min(1, Math.max(0, settings[k] + (code === 'KeyD' ? 0.05 : -0.05))) * 100) / 100;
+      saveSettings();
+    } else if (confirm || code === 'Escape') page = null;
+  } else if (page === 'achievements') {
+    if (confirm || code === 'Escape') page = null;
+  } else if (scene === 'title') {
     if (confirm) scene = 'select';
   } else if (scene === 'select') {
     if (code === 'KeyA') stepSel(-1);
@@ -1129,21 +1660,37 @@ function onKey(code) {
     if (code === 'Escape' && fightState === 'playing') fightState = 'paused';
     else if (code === 'Escape' && fightState === 'paused') fightState = 'playing';
     else if (confirm && overlayVisible()) activateOverlayButton();
-    else if (fightState === 'playing') typePromptKey(code);
+    else if (fightState === 'playing') {
+      if (DEBUG_KEYS && code === 'KeyY') launchSpinner(); // DEBUG: spawn a spinner (still types Y into a prompt too)
+      typePromptKey(code);
+    }
   }
 }
 
-// Enter/Space press the first (primary) button: PLAY when paused, LOBBY after a win or loss
+// Enter/Space press the primary button: play when paused, lobby after a win or loss
 function activateOverlayButton() {
-  overlayButtons()[0].action();
+  const list = overlayButtons();
+  (list.find(b => b.primary) ?? list[0]).action();
 }
 
 function mousePos(e) {
   const r = canvas.getBoundingClientRect();
   return { x: (e.clientX - r.left) * canvas.width / r.width, y: (e.clientY - r.top) * canvas.height / r.height };
 }
+canvas.addEventListener('mousedown', e => {
+  Object.assign(mouse, mousePos(e));
+  if (page === 'settings') {
+    dragSlider = sliderAt(mouse);
+    if (dragSlider) { selSlider = SLIDERS.indexOf(dragSlider); setSliderFromMouse(dragSlider); }
+  }
+});
+addEventListener('mouseup', () => {
+  if (dragSlider) saveSettings();
+  dragSlider = null;
+});
 canvas.addEventListener('mousemove', e => {
   Object.assign(mouse, mousePos(e));
+  if (dragSlider) setSliderFromMouse(dragSlider);
   if (scene === 'select') {
     const i = bannerAt(mouse);
     if (i >= 0) sel = i;
@@ -1151,12 +1698,14 @@ canvas.addEventListener('mousemove', e => {
 });
 canvas.addEventListener('click', e => {
   Object.assign(mouse, mousePos(e));
-  if (scene === 'title' && playHovered()) scene = 'select';
+  if (page) {
+    roundButtonAt(MENU_BACK, mouse)?.action();
+  } else if (scene === 'title') roundButtonAt(TITLE_BUTTONS, mouse)?.action();
   else if (scene === 'select') {
     const i = bannerAt(mouse);
     if (i >= 0) startFight(sel = i);
   } else if (scene === 'fight' && overlayVisible()) {
-    overlayButtons().find(b => inRect(b.r, mouse))?.action();
+    roundButtonAt(overlayButtons(), mouse)?.action();
   }
 });
 
@@ -1173,7 +1722,7 @@ function drawTitle() {
     ctx.fillText('AstroCat', canvas.width / 2, 200);
   }
 
-  drawButton(PLAY_BTN, 'PLAY');
+  for (const b of TITLE_BUTTONS) drawRoundButton(b);
 }
 
 function roundRectPath(x, y, w, h, rad) {
@@ -1236,15 +1785,18 @@ function drawButton(r, label) {
 const PANEL = { w: 460, h: 450, x: (canvas.width - 460) / 2, y: 45 };
 // the win panel is taller to make room for the star row
 const PANEL_WIN = { w: 460, h: 510, x: (canvas.width - 460) / 2, y: 15 };
-const btnAt = (y, panel = PANEL) => ({ w: 220, h: 64, x: (canvas.width - 220) / 2, y: panel.y + y });
 const resumeFight = () => { fightState = 'playing'; };
-const goLobby = () => { scene = 'title'; };
-const PAUSE_BUTTONS = [
-  { r: btnAt(290), label: 'PLAY', action: resumeFight },
-  { r: btnAt(366), label: 'LOBBY', action: goLobby },
-];
-const END_BUTTONS = [{ r: btnAt(PANEL.h - 90), label: 'LOBBY', action: goLobby }];
-const WIN_BUTTONS = [{ r: btnAt(PANEL_WIN.h - 80, PANEL_WIN), label: 'LOBBY', action: goLobby }];
+const goLobby = () => { scene = 'title'; saveStats(); };
+const PANEL_BTN_D = 110; // play button size on the panels; the side buttons are 15% smaller
+const PAUSE_BUTTONS = roundButtonRow(PANEL.y + 355, PANEL_BTN_D, 25, [
+  { icon: 'settings', action: () => { page = 'settings'; } },
+  { icon: 'play', big: true, primary: true, action: resumeFight },
+  { icon: 'lobby', action: goLobby },
+]);
+// win and lose panels: just the lobby button, at the side-button size
+const lobbyOnly = y => roundButtonRow(y, PANEL_BTN_D, 0, [{ icon: 'lobby', primary: true, action: goLobby }]);
+const END_BUTTONS = lobbyOnly(PANEL.y + 360); // clear of the bottom border, even while hover-grown
+const WIN_BUTTONS = lobbyOnly(PANEL_WIN.y + 435); // just under the stars, clear of the panel's bottom border
 const overlayButtons = () => fightState === 'paused' ? PAUSE_BUTTONS : fightState === 'won' ? WIN_BUTTONS : END_BUTTONS;
 
 // 5-point star centered at (cx, cy) with outer radius R
@@ -1264,9 +1816,9 @@ function drawStarRow(cx, cy, R, spacing, filled) {
   ctx.lineJoin = 'round';
   for (let i = 0; i < 3; i++) {
     starPath(cx + (i - 1) * spacing, cy, R);
-    ctx.fillStyle = i < filled ? COLOR.purple : COLOR.lavender;
+    ctx.fillStyle = i < filled ? UI.band : UI.pink;
     ctx.fill();
-    ctx.strokeStyle = i < filled ? COLOR.ink : COLOR.track;
+    ctx.strokeStyle = i < filled ? UI.plum : UI.soft;
     ctx.stroke();
   }
   ctx.lineJoin = 'miter';
@@ -1279,9 +1831,9 @@ function drawStars(cx, cy, t) {
   for (let i = 0; i < 3; i++) {
     const x = cx + (i - 1) * spacing;
     starPath(x, cy, R);
-    ctx.fillStyle = COLOR.lavender;
+    ctx.fillStyle = UI.pink;
     ctx.fill();
-    ctx.strokeStyle = COLOR.track;
+    ctx.strokeStyle = UI.soft;
     ctx.lineWidth = 3;
     ctx.lineJoin = 'round';
     ctx.stroke();
@@ -1293,14 +1845,73 @@ function drawStars(cx, cy, t) {
       ctx.translate(x, cy);
       ctx.scale(s, s);
       starPath(0, 0, R);
-      ctx.fillStyle = COLOR.purple;
+      ctx.fillStyle = UI.band;
       ctx.fill();
-      ctx.strokeStyle = COLOR.ink;
+      ctx.strokeStyle = UI.plum;
+      ctx.lineWidth = 4;
       ctx.stroke();
       ctx.restore();
     }
     ctx.lineJoin = 'miter';
   }
+}
+
+// ---- themed panels: built like the icon buttons (plum rim, purple band, soft pink face) with a bubbly title ----
+const UI = {
+  plum: '#5c1a45', lip: '#3a0f2c', band: '#9c5489', pink: '#f2c4e0',
+  face: '#fdf0f7', line: '#e8bfd9', soft: '#b77aa6',
+};
+
+function drawThemePanel(P, title) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(28, 8, 24, 0.55)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  roundRectPath(P.x, P.y + 8, P.w, P.h, 30); // drop lip, like the buttons
+  ctx.fillStyle = UI.lip;
+  ctx.fill();
+  roundRectPath(P.x, P.y, P.w, P.h, 30);
+  ctx.fillStyle = UI.plum;
+  ctx.fill();
+  roundRectPath(P.x + 7, P.y + 7, P.w - 14, P.h - 14, 24);
+  ctx.fillStyle = UI.band;
+  ctx.fill();
+  roundRectPath(P.x + 17, P.y + 17, P.w - 34, P.h - 34, 16);
+  ctx.fillStyle = UI.face;
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = UI.plum;
+  ctx.stroke();
+
+  // little highlight dots on the band, echoing the dots on the icons
+  ctx.fillStyle = UI.pink;
+  for (const [dx, dy] of [[14, 14], [P.w - 14, 14], [14, P.h - 14], [P.w - 14, P.h - 14]]) {
+    ctx.beginPath();
+    ctx.arc(P.x + dx, P.y + dy, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+  drawBubbleText(title, canvas.width / 2, P.y + 58, 40, P.w - 130);
+}
+
+// purple letters with a thick plum outline, like the title wordmark (shrunk to fit `maxW` if needed)
+function drawBubbleText(text, x, y, size, maxW = Infinity) {
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `bold ${size}px Fredoka, sans-serif`;
+  const w = ctx.measureText(text).width * 1.1; // room for the outline
+  if (w > maxW) {
+    size *= maxW / w;
+    ctx.font = `bold ${size}px Fredoka, sans-serif`;
+  }
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = size * 0.22;
+  ctx.strokeStyle = UI.plum;
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = UI.band;
+  ctx.fillText(text, x, y);
+  ctx.restore();
 }
 
 function drawOverlay() {
@@ -1309,60 +1920,39 @@ function drawOverlay() {
   const cx = canvas.width / 2;
   const progress = elapsed / songLength();
 
-  ctx.fillStyle = 'rgba(61, 43, 107, 0.35)';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = COLOR.white;
-  ctx.fillRect(P.x, P.y, P.w, P.h);
-  ctx.strokeStyle = boss.color;
-  ctx.lineWidth = 4;
-  ctx.strokeRect(P.x, P.y, P.w, P.h);
-
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = won ? COLOR.purple : COLOR.ink;
-  ctx.font = 'bold 38px Fredoka, sans-serif';
-  ctx.fillText(won ? 'Boss scared away!' : fightState === 'lost' ? 'Defeated!' : 'PAUSED', cx, P.y + 50);
+  drawThemePanel(P, won ? 'Boss scared away!' : fightState === 'lost' ? 'Defeated!' : 'Paused');
 
   // boss portrait + name
-  ctx.fillStyle = boss.color;
-  ctx.beginPath();
-  ctx.ellipse(cx, P.y + 125, 30, 40, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = COLOR.ink;
+  if (!drawBossSprite(cx, P.y + 128, 88)) {
+    ctx.fillStyle = boss.color;
+    ctx.beginPath();
+    ctx.ellipse(cx, P.y + 128, 28, 38, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = UI.plum;
+    ctx.stroke();
+  }
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = UI.plum;
   ctx.font = 'bold 28px Fredoka, sans-serif';
-  ctx.fillText(boss.name, cx, P.y + 185);
+  ctx.fillText(boss.name, cx, P.y + 190);
 
-  // progress: |=====■------|
-  const bw = 320, bx = cx - bw / 2, by = P.y + 225, capH = 20;
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = COLOR.track;
-  ctx.beginPath();
-  ctx.moveTo(bx, by); ctx.lineTo(bx + bw, by);
-  ctx.moveTo(bx, by - capH / 2); ctx.lineTo(bx, by + capH / 2);
-  ctx.moveTo(bx + bw, by - capH / 2); ctx.lineTo(bx + bw, by + capH / 2);
-  ctx.stroke();
-  ctx.strokeStyle = boss.color;
-  ctx.lineWidth = 6;
-  ctx.beginPath();
-  ctx.moveTo(bx, by); ctx.lineTo(bx + bw * progress, by);
-  ctx.stroke();
-  ctx.fillStyle = COLOR.ink;
-  ctx.fillRect(bx + bw * progress - 6, by - 6, 12, 12);
-  ctx.fillStyle = COLOR.muted;
-  ctx.font = '22px Fredoka, sans-serif';
+  // progress: the same |-------■------| bar as the top of the screen, just bigger
+  const bw = 320, bx = cx - bw / 2, by = P.y + 228;
+  drawProgressBar(bx, by, bw, 1.4);
+  ctx.fillStyle = UI.soft;
+  ctx.font = 'bold 22px Fredoka, sans-serif';
   ctx.fillText(`${Math.floor(progress * 100)}%`, cx, by + 32);
 
   if (won) {
-    ctx.fillStyle = COLOR.purple;
+    ctx.fillStyle = UI.band;
     ctx.font = 'bold 28px Fredoka, sans-serif';
-    ctx.fillText(`Points: ${score}`, cx, P.y + 295);
-    ctx.fillStyle = COLOR.ink;
-    ctx.font = 'bold 24px Fredoka, sans-serif';
-    ctx.fillText(`Highest combo: x${maxCombo}`, cx, P.y + 332);
-    drawStars(cx, P.y + 385, endTimer - END_DELAY);
+    ctx.fillText(`Points: ${score} (x${maxCombo} Combo)`, cx, P.y + 300);
+    drawStars(cx, P.y + 358, endTimer - END_DELAY);
   }
 
-  for (const b of overlayButtons()) drawButton(b.r, b.label);
+  for (const b of overlayButtons()) drawRoundButton(b);
 }
 
 // banners glide up when hovered and settle back down when not
@@ -1398,12 +1988,16 @@ function drawSelect() {
     ctx.lineWidth = active ? 5 : 3;
     ctx.stroke();
 
-    ctx.font = 'bold 72px Fredoka, sans-serif';
-    ctx.lineWidth = 6;
+    // bosses with art show it on their banner, with the number moved up top; the rest keep the big number
+    const art = !b.locked && b.img;
+    const numY = y + BANNER.h * (art ? 0.13 : 0.4);
+    ctx.font = `bold ${art ? 40 : 72}px Fredoka, sans-serif`;
+    ctx.lineWidth = art ? 5 : 6;
     ctx.strokeStyle = b.locked ? COLOR.track : COLOR.ink;
-    ctx.strokeText(String(i + 1), x + BANNER.w / 2, y + BANNER.h * 0.4);
+    ctx.strokeText(String(i + 1), x + BANNER.w / 2, numY);
     ctx.fillStyle = COLOR.white;
-    ctx.fillText(String(i + 1), x + BANNER.w / 2, y + BANNER.h * 0.4);
+    ctx.fillText(String(i + 1), x + BANNER.w / 2, numY);
+    if (art) drawSprite(b.img, b.spriteBox, x + BANNER.w / 2, y + BANNER.h * 0.49, 150);
 
     if (b.locked) {
       ctx.fillStyle = COLOR.muted;
@@ -1416,27 +2010,142 @@ function drawSelect() {
   });
 }
 
+// ---- settings and achievements pages (opened from the title screen) ----
+const MENU_PANEL = { w: 520, h: 450, x: (canvas.width - 520) / 2, y: 45 };
+const MENU_BACK = roundButtonRow(MENU_PANEL.y + MENU_PANEL.h - 80, // clear of the bottom border, even while hover-grown
+  PANEL_BTN_D, 0, [{ icon: 'back', action: () => { page = null; } }]);
+
+function drawMenuPanel(title) {
+  drawThemePanel(MENU_PANEL, title);
+  for (const b of MENU_BACK) drawRoundButton(b);
+}
+
+// volume sliders: drag with the mouse, or W/S to pick one and A/D to adjust
+const SLIDERS = [{ key: 'music', label: 'Music' }, { key: 'sfx', label: 'Sound effects' }].map((s, i) => ({
+  ...s,
+  x0: MENU_PANEL.x + 60, x1: MENU_PANEL.x + MENU_PANEL.w - 60, y: MENU_PANEL.y + 170 + i * 95,
+}));
+let selSlider = 0;
+let dragSlider = null;
+const sliderAt = p => SLIDERS.find(s => p.x >= s.x0 - 14 && p.x <= s.x1 + 14 && Math.abs(p.y - s.y) <= 18);
+function setSliderFromMouse(s) {
+  settings[s.key] = Math.round(Math.min(1, Math.max(0, (mouse.x - s.x0) / (s.x1 - s.x0))) * 100) / 100;
+}
+
+function drawSettings() {
+  drawMenuPanel('Settings');
+  SLIDERS.forEach((s, i) => {
+    const v = settings[s.key], focused = i === selSlider;
+    ctx.font = 'bold 24px Fredoka, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = focused ? UI.band : UI.plum;
+    ctx.fillText(s.label, s.x0, s.y - 34);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = UI.soft;
+    ctx.fillText(`${Math.round(v * 100)}%`, s.x1, s.y - 34);
+
+    // pill track in the panel's colors, filled purple up to the value
+    roundRectPath(s.x0, s.y - 7, s.x1 - s.x0, 14, 7);
+    ctx.fillStyle = UI.pink;
+    ctx.fill();
+    if (v > 0) {
+      ctx.save();
+      roundRectPath(s.x0, s.y - 7, s.x1 - s.x0, 14, 7);
+      ctx.clip();
+      ctx.fillStyle = UI.band;
+      ctx.fillRect(s.x0, s.y - 7, (s.x1 - s.x0) * v, 14);
+      ctx.restore();
+    }
+    roundRectPath(s.x0, s.y - 7, s.x1 - s.x0, 14, 7);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = UI.plum;
+    ctx.stroke();
+
+    // knob: a little version of the round buttons
+    const kx = s.x0 + (s.x1 - s.x0) * v, kr = focused ? 16 : 14;
+    ctx.beginPath();
+    ctx.arc(kx, s.y, kr, 0, Math.PI * 2);
+    ctx.fillStyle = UI.plum;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(kx, s.y, kr * 0.72, 0, Math.PI * 2);
+    ctx.fillStyle = UI.pink;
+    ctx.fill();
+  });
+}
+
+const formatTime = secs => {
+  const s = Math.floor(secs), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${r}s` : `${r}s`;
+};
+
+function drawAchievements() {
+  drawMenuPanel('Achievements');
+  const starsEarned = bestStars.reduce((a, b) => a + b, 0);
+  const rows = [
+    ['Top combo', `x${stats.topCombo}`],
+    ['Stars earned', `${starsEarned} / ${BOSSES.length * 3}`],
+    ['Most points', String(stats.bestScore)],
+    ['Time played', formatTime(stats.timePlayed)],
+  ];
+  const x0 = MENU_PANEL.x + 60, x1 = MENU_PANEL.x + MENU_PANEL.w - 60;
+  ctx.font = 'bold 26px Fredoka, sans-serif';
+  ctx.textBaseline = 'middle';
+  rows.forEach(([label, value], i) => {
+    const y = MENU_PANEL.y + 125 + i * 55;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = UI.plum;
+    ctx.fillText(label, x0, y);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = UI.band;
+    ctx.fillText(value, x1, y);
+    if (i < rows.length - 1) {
+      roundRectPath(x0, y + 26, x1 - x0, 3, 1.5);
+      ctx.fillStyle = UI.line;
+      ctx.fill();
+    }
+  });
+}
+
 let last = performance.now();
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.05); // clamp after tab switches
   last = now;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!(scene === 'fight' && fightState === 'paused')) updateBackground(dt); // freezes while paused
-  drawBackground();
-  if (scene === 'title') drawTitle();
+  if (!(scene === 'fight' && fightState === 'paused')) { // backgrounds freeze while paused
+    updateBackground(dt);
+    fightSkyScroll += FIGHT_BG.skySpeed * dt;
+  }
+  ctx.save();
+  if (scene !== 'fight') drawBackground(); // menus get the scrolling space scene
+  else {                                   // fights get their boss's backdrop, rolling with the camera
+    applyCameraRoll();
+    drawFightBackground();
+  }
+  ctx.restore();
+  if (scene === 'title') { updateRoundButtons(TITLE_BUTTONS, dt); drawTitle(); }
   else if (scene === 'select') { updateSelect(dt); drawSelect(); }
   else {
     if (fightState !== 'paused') updateFight(dt);
     // screen shake after a hit, fading out (held still while paused)
     ctx.save();
+    applyCameraRoll();
     if (screenShake > 0 && fightState !== 'paused') {
       const mag = HIT.shakeMag * (screenShake / HIT.shake);
       ctx.translate((Math.random() * 2 - 1) * mag, (Math.random() * 2 - 1) * mag);
     }
     drawFight();
     ctx.restore();
-    if (overlayVisible()) drawOverlay();
+    drawFightHud();
+    if (overlayVisible()) {
+      updateRoundButtons(overlayButtons(), dt);
+      drawOverlay();
+    }
   }
+  if (page) updateRoundButtons(MENU_BACK, dt, true);
+  if (page === 'settings') drawSettings();
+  else if (page === 'achievements') drawAchievements();
   syncMusic();
   canvas.style.cursor = scene === 'fight' && !overlayVisible() ? 'none' : 'default'; // no cursor while fighting
   requestAnimationFrame(frame);

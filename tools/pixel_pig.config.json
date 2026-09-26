@@ -1,0 +1,14 @@
+{
+  "id": "pixel_pig",
+  "seed": 1,
+  "drops": [
+    { "build": 34, "drop": 42, "spinner": true, "spinnerAim": 45 },
+    { "build": 114, "drop": 122, "spinner": true, "spinnerAim": 45 }
+  ],
+  "quad_add": [46, 50, 54, 62, 70],
+  "remove": [],
+  "add": [
+    { "t": 74.004, "a": "spinner", "dur": 5.9, "rev": [ 2, 4 ], "tiltScreen": true },
+    { "t": 82.004, "a": "spinner", "dur": 6, "rev": [ 2, 4 ], "tiltScreen": true, "doubleSided": true }
+  ]
+}
