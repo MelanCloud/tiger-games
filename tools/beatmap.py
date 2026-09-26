@@ -27,10 +27,11 @@ Attacks (`t` is when the attack lands, the game starts wind-ups early so they hi
     beamUp / beamDown {x?, shake?}   vertical beam, x = 0..1 across the arena (random if left out); lands when it
                      fires. `shake` swings the screen toward the beam's side as it fires (1 = a full beam-run sway)
     bomb             lands when it explodes
-    spinner {dur?, rev?, spin?, tiltScreen?, aim?, doubleSided?}   lands when the laser starts; optional laser
-                     length, seconds into the laser when it reverses (a number or a list), spin speed (radians per
-                     second), whether the screen leans very slowly against the laser's turn, degrees beside the player
-                     to start (turning toward them), and whether the laser shoots out both sides of the orb
+    spinner {dur?, rev?, spin?, tiltScreen?, aim?, doubleSided?, arms?}   lands when the laser starts; optional
+                     laser length, seconds into the laser when it reverses (a number or a list), spin speed (radians
+                     per second), whether the screen leans very slowly against the laser's turn, degrees beside the
+                     player to start (turning toward them), whether the laser shoots out both sides of the orb, and
+                     [[seconds into the laser, number of arms], ...] to grow arms (2 = both sides, 3 = a three-way star)
     tilt {dir}       the whole screen sways left (-1) or right (1), then settles back (not an attack)
     pulse {power}    boss bounces to a bass kick, power 0..1 (not an attack)
 

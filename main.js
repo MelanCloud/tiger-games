@@ -25,6 +25,7 @@ BAR.x = (canvas.width - BAR.w) / 2; // centered
 
 const MAX_HP = 5;
 const REGEN_INTERVAL = 5; // seconds per 1 hp (short for prototyping)
+const PROMPT_REGEN_BONUS = 3; // seconds a completed prompt takes off the wait for the next heart
 const REGEN_ANIM = 0.5;   // seconds of "lines burst outward" before the orb appears
 const END_DELAY = 1.2;    // seconds of win/lose escape animation before the result panel
 
@@ -54,6 +55,7 @@ const BEAM = {
   fire: 0.3,    // total seconds the beam is live (damaging)
   sparks: 40,
 };
+const BEAM_OVERDRAW = 150; // px beams are drawn past the top and bottom edges
 const shots = []; // { x, y, vx, vy }
 const beams = []; // { x, dir (1 = down, -1 = up), t, hit }
 const sparks = []; // { x, y, vx, vy, age, life, size, color }
@@ -72,6 +74,7 @@ const SPINNER = {
   width: 18,
   hitCooldown: 0.8,   // after a hit, the laser can't hurt again for this long
   startSpread: 20 * Math.PI / 180, // the laser starts within this angle of pointing straight away from the player
+  splashRate: 100,    // mud specks per second splashing off the screen edge where each arm hits it
 };
 let spinner = null; // { x, y, vx, vy, t, phase, firing, angle0, angle, dir, cool }
 
@@ -516,6 +519,8 @@ function startFight(bossIndex) {
   bombs.length = 0;
   beams.length = 0;
   sparks.length = 0;
+  rockets.length = 0;
+  blasts.length = 0;
   spinner = null;
   attackTimer = 0;
   Object.assign(boss, { shakeT: 0, ceaseT: 0, pulse: 0 });
@@ -586,10 +591,124 @@ function completePrompt() {
   score += promptPoints(combo);
   const text = comboCallout(combo);
   callout = text ? { text, t: 0 } : null;
-  boss.shakeT = BOSS_STUN.shake;
-  boss.ceaseT = BOSS_STUN.ceasefire;
+  launchRocket(); // the boss is stunned when it lands
+  // typing a prompt also brings the next heart sooner (never past "ready now")
+  if (health.hp < MAX_HP && !regen) health.regenTimer = Math.min(REGEN_INTERVAL, health.regenTimer + PROMPT_REGEN_BONUS);
   typing = null;
   promptTimer = randomPromptGap();
+}
+
+// ---- the cat's counterattack: a little rocket that homes in on the boss and explodes, stunning it ----
+const ROCKET = {
+  launchSpeed: 260, topSpeed: 950, accel: 1400, // px/s, px/s^2
+  turn: 4,          // radians per second it can turn toward the boss
+  len: 22,
+};
+const rockets = []; // { x, y, vx, vy, t }
+const blasts = [];  // rocket explosion specks, drawn in front of the boss (same shape as `sparks`)
+
+function launchRocket() {
+  // pops up and forward out of the cat, then curves round onto the boss
+  const up = player.y > canvas.height / 2 ? -1 : 1; // arcs toward the roomier side: up from the lower half, else down
+  rockets.push({ x: player.x + 10, y: player.y, vx: ROCKET.launchSpeed * 0.35, vy: ROCKET.launchSpeed * up, t: 0 });
+}
+
+function updateRockets(dt) {
+  for (let i = rockets.length - 1; i >= 0; i--) {
+    const r = rockets[i];
+    r.t += dt;
+    const tx = boss.x - 20, ty = boss.y;
+    let heading = Math.atan2(r.vy, r.vx);
+    let diff = Math.atan2(ty - r.y, tx - r.x) - heading;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    heading += Math.max(-ROCKET.turn * dt, Math.min(ROCKET.turn * dt, diff));
+    const speed = Math.min(ROCKET.topSpeed, Math.hypot(r.vx, r.vy) + ROCKET.accel * dt);
+    r.vx = Math.cos(heading) * speed;
+    r.vy = Math.sin(heading) * speed;
+    r.x += r.vx * dt;
+    r.y += r.vy * dt;
+    // puffs of smoke behind it
+    sparks.push({
+      x: r.x - Math.cos(heading) * ROCKET.len * 0.6, y: r.y - Math.sin(heading) * ROCKET.len * 0.6,
+      vx: (Math.random() - 0.5) * 40, vy: (Math.random() - 0.5) * 40,
+      age: 0, life: 0.35 + Math.random() * 0.2, size: 4 + Math.random() * 3,
+      color: Math.random() < 0.5 ? '#ffffff' : '#e6dff5',
+    });
+    if (Math.hypot(tx - r.x, ty - r.y) < 30 || r.t > 3) {
+      explodeRocket(r);
+      rockets.splice(i, 1);
+    }
+  }
+  for (let i = blasts.length - 1; i >= 0; i--) {
+    const b = blasts[i];
+    b.age += dt;
+    if (b.age >= b.life) { blasts.splice(i, 1); continue; }
+    const drag = Math.exp(-3 * dt);
+    b.vx *= drag; b.vy *= drag;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+  }
+}
+
+function explodeRocket(r) {
+  for (let i = 0; i < 34; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 120 + Math.random() * 320;
+    blasts.push({
+      x: r.x, y: r.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      age: 0, life: 0.35 + Math.random() * 0.4, size: 4 + Math.random() * 5,
+      color: ['#ffd23f', '#ff9f43', '#ff5e3a', '#ffffff'][Math.floor(Math.random() * 4)],
+    });
+  }
+  if (fightState === 'playing') {
+    boss.shakeT = BOSS_STUN.shake;
+    boss.ceaseT = BOSS_STUN.ceasefire;
+  }
+}
+
+function drawRockets() {
+  for (const b of blasts) {
+    ctx.globalAlpha = Math.pow(1 - b.age / b.life, 0.6);
+    ctx.fillStyle = b.color;
+    ctx.fillRect(b.x - b.size / 2, b.y - b.size / 2, b.size, b.size);
+  }
+  ctx.globalAlpha = 1;
+  for (const r of rockets) {
+    const L = ROCKET.len;
+    ctx.save();
+    ctx.translate(r.x, r.y);
+    ctx.rotate(Math.atan2(r.vy, r.vx));
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = COLOR.ink;
+    // flickering flame
+    const f = 0.7 + Math.random() * 0.5;
+    ctx.fillStyle = '#ff9f43';
+    ctx.beginPath();
+    ctx.moveTo(-L / 2, -4); ctx.lineTo(-L / 2 - 12 * f, 0); ctx.lineTo(-L / 2, 4);
+    ctx.fill();
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath();
+    ctx.moveTo(-L / 2, -2); ctx.lineTo(-L / 2 - 7 * f, 0); ctx.lineTo(-L / 2, 2);
+    ctx.fill();
+    // fins
+    ctx.fillStyle = COLOR.purple;
+    ctx.beginPath();
+    ctx.moveTo(-L / 2 + 2, -4); ctx.lineTo(-L / 2 - 3, -9); ctx.lineTo(-L / 2 + 7, -4);
+    ctx.moveTo(-L / 2 + 2, 4); ctx.lineTo(-L / 2 - 3, 9); ctx.lineTo(-L / 2 + 7, 4);
+    ctx.fill();
+    ctx.stroke();
+    // body and nose
+    roundRectPath(-L / 2, -5, L * 0.75, 10, 4);
+    ctx.fillStyle = COLOR.white;
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#ff5e7a';
+    ctx.beginPath();
+    ctx.moveTo(L / 4 - 1, -5); ctx.lineTo(L / 2 + 4, 0); ctx.lineTo(L / 4 - 1, 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
 // ---- boss attacks ----
@@ -660,6 +779,42 @@ const shootDown = (x, shake) => shootBeam(1, x, shake);  // sweeps from the top 
 const shootUp = (x, shake) => shootBeam(-1, x, shake);   // sweeps from the bottom edge up
 
 // leftover energy drifting off the column once a beam ends
+// a burst of the same mud specks where the beam touches a screen edge: `away` = +1 sprays downward, -1 upward.
+// `splash` makes a bigger, heavier spray that arcs back under gravity, for the beam's tip hitting the far edge.
+function spawnBeamBurst(b, y, away, splash) {
+  spawnSplash(b.x, y, 0, away, splash ? 28 : 14, splash, BEAM.w);
+}
+
+// `n` mud specks sprayed from (x, y) along the direction (nx, ny) (unit length), fanned out either side of it and
+// scattered across `width` px. A `splash` is bigger and heavier, and its specks arc back toward where they came from.
+function spawnSplash(x, y, nx, ny, n, splash, width = 0) {
+  for (let i = 0; i < n; i++) {
+    const a = (Math.random() * 2 - 1) * (splash ? 1.2 : 0.9);
+    const sp = (splash ? 180 : 90) + Math.random() * (splash ? 260 : 120);
+    const dx = nx * Math.cos(a) - ny * Math.sin(a), dy = nx * Math.sin(a) + ny * Math.cos(a);
+    const w = (Math.random() - 0.5) * width;
+    sparks.push({
+      x: x - ny * w, y: y + nx * w,
+      vx: dx * sp, vy: dy * sp,
+      gx: splash ? -nx * 700 : 0, g: splash ? -ny * 700 : 0,
+      age: 0, life: 0.5 + Math.random() * 0.5,
+      size: 3 + Math.random() * (splash ? 5 : 3),
+      color: Math.random() < 0.5 ? MUD.mid : MUD.light,
+    });
+  }
+}
+
+// where a ray from (x, y) at `angle` leaves the screen, and which way is back into the screen from there
+function screenExit(x, y, angle) {
+  const dx = Math.cos(angle), dy = Math.sin(angle), W = canvas.width, H = canvas.height;
+  let best = { t: Infinity };
+  if (dx > 1e-6) best = { t: (W - x) / dx, nx: -1, ny: 0 };
+  else if (dx < -1e-6) best = { t: -x / dx, nx: 1, ny: 0 };
+  if (dy > 1e-6 && (H - y) / dy < best.t) best = { t: (H - y) / dy, nx: 0, ny: -1 };
+  else if (dy < -1e-6 && -y / dy < best.t) best = { t: -y / dy, nx: 0, ny: 1 };
+  return { x: x + dx * best.t, y: y + dy * best.t, nx: best.nx, ny: best.ny };
+}
+
 function spawnBeamSparks(b) {
   for (let i = 0; i < BEAM.sparks; i++) {
     const x = b.x + (Math.random() - 0.5) * BEAM.w;
@@ -715,12 +870,14 @@ function explodeBomb(b) {
 // optional: `dur` = laser seconds, `rev` = seconds into the laser when it reverses direction (a number, or a list to
 // reverse several times), `spin` = radians/sec, `tiltScreen` = the screen leans very slowly against the laser's turn,
 // `aim` = degrees: start that far to one side of the player and sweep toward them (default: start pointing away),
-// `doubleSided` = the laser shoots out both sides of the orb
+// `doubleSided` = the laser shoots out both sides of the orb, `arms` = [[seconds into the laser, number of arms], ...]
+// to grow more arms as it goes (1 = one side, 2 = both sides, 3 = a three-way star, ...)
 function launchSpinner({
-  dur = SPINNER.laser, rev = [], spin = SPINNER.spin, tiltScreen = false, aim = null, doubleSided = false,
+  dur = SPINNER.laser, rev = [], spin = SPINNER.spin, tiltScreen = false, aim = null, doubleSided = false, arms = [],
 } = {}) {
   if (spinner) return;
   rev = [].concat(rev ?? []).sort((a, b) => a - b);
+  const armSchedule = [[0, doubleSided ? 2 : 1], ...(arms ?? [])].sort((a, b) => a[0] - b[0]);
   const m = SPINNER.margin;
   const top = BAR.y + BAR.capH + m;
   const tx = m + Math.random() * (BOSS_HOME_X - boss.rx - 2 * m);
@@ -731,7 +888,7 @@ function launchSpinner({
   spinner = {
     x: boss.x, y: boss.y, vx: (dx / dist) * speed, vy: (dy / dist) * speed,
     t: 0, phase: 0, firing: false, angle0: 0, angle: 0,
-    dir: Math.random() < 0.5 ? 1 : -1, cool: 0, dur, rev, spin, tiltScreen, aim, doubleSided,
+    dir: Math.random() < 0.5 ? 1 : -1, cool: 0, dur, rev, spin, tiltScreen, aim, armSchedule,
   };
 }
 
@@ -764,7 +921,7 @@ function updateSpinner(dt) {
     const toPlayer = Math.atan2(player.y - s.y, player.x - s.x);
     const spread = (Math.random() * 2 - 1) * SPINNER.startSpread;
     s.angle0 = s.aim !== null ? toPlayer - s.dir * (s.aim * Math.PI / 180)
-      : s.doubleSided ? toPlayer + Math.PI / 2 + spread
+      : s.armSchedule[0][1] > 1 ? toPlayer + Math.PI / 2 + spread
       : toPlayer + Math.PI + spread;
   }
   const lt = s.t - SPINNER.fuse;
@@ -782,6 +939,25 @@ function updateSpinner(dt) {
   }
   swept += sign * (lt - from);
   s.angle = s.angle0 + s.dir * s.spin * swept;
+
+  // mud splashes, like the beams': a puff out of the orb along each arm as the laser fires, then a steady splatter
+  // where each arm hits the edge of the screen
+  const arms = spinnerArms(s);
+  for (const [i, arm] of arms.entries()) {
+    const a = s.angle + arm.off;
+    if (!s.puffed?.[i] && arm.fade > 0) {
+      (s.puffed ??= [])[i] = true;
+      spawnSplash(s.x, s.y, Math.cos(a), Math.sin(a), 12, false);
+    }
+    if (arm.fade >= 0.5) {
+      const hit = screenExit(s.x, s.y, a);
+      s.splashAcc = (s.splashAcc ?? 0) + SPINNER.splashRate * dt;
+      while (s.splashAcc >= 1) {
+        s.splashAcc--;
+        spawnSplash(hit.x, hit.y, hit.nx, hit.ny, 1, true, SPINNER.width);
+      }
+    }
+  }
   if (s.tiltScreen) {
     // lean the opposite way to the laser's turn (positive = clockwise), flipping each time it reverses
     camera.target = -s.dir * sign;
@@ -794,13 +970,37 @@ function updateSpinner(dt) {
   }
 }
 
-// player circle vs the laser segment
-// player circle vs the laser (a segment out from the orb, or through it both ways when double-sided)
+// A spinner's arms are spread evenly around the orb (2 = opposite sides, 3 = every 120 degrees, ...). When it gains
+// arms, the existing ones glide round to the new spacing over ARM_MOVE seconds while the new ones fade in.
+const ARM_MOVE = 0.3;
+const ease = u => u * u * (3 - 2 * u);
+
+// each arm's angle off the main one and how far it has faded in (0..1; an arm only hurts once fully in)
+function spinnerArms(s) {
+  const lt = s.t - SPINNER.fuse, sched = s.armSchedule;
+  let k = 0;
+  while (k + 1 < sched.length && sched[k + 1][0] <= lt) k++;
+  const [t0, n] = sched[k], n0 = k > 0 ? sched[k - 1][1] : n;
+  const u = ease(Math.max(0, Math.min(1, (lt - t0) / ARM_MOVE)));
+  const arms = [];
+  for (let i = 0; i < n; i++) {
+    const to = (2 * Math.PI * i) / n;
+    if (i < n0) arms.push({ off: (2 * Math.PI * i) / n0 + (to - (2 * Math.PI * i) / n0) * u, fade: 1 });
+    else arms.push({ off: to, fade: Math.max(0, Math.min(1, (lt - t0) / SPINNER.fadeIn)) });
+  }
+  if (k === 0) arms.forEach(a => { a.fade = Math.max(0, Math.min(1, lt / SPINNER.fadeIn)); });
+  return arms;
+}
+
+// player circle vs each fully-in arm (a segment out from the orb)
 function laserHitsPlayer(s) {
-  const ex = Math.cos(s.angle) * SPINNER.length, ey = Math.sin(s.angle) * SPINNER.length;
   const px = player.x - s.x, py = player.y - s.y;
-  const t = Math.max(s.doubleSided ? -1 : 0, Math.min(1, (px * ex + py * ey) / (ex * ex + ey * ey)));
-  return Math.hypot(px - ex * t, py - ey * t) < player.r + SPINNER.width / 2;
+  return spinnerArms(s).some(({ off, fade }) => {
+    if (fade < 1) return false;
+    const ex = Math.cos(s.angle + off) * SPINNER.length, ey = Math.sin(s.angle + off) * SPINNER.length;
+    const t = Math.max(0, Math.min(1, (px * ex + py * ey) / (ex * ex + ey * ey)));
+    return Math.hypot(px - ex * t, py - ey * t) < player.r + SPINNER.width / 2;
+  });
 }
 
 const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb, launchSpinner];
@@ -818,7 +1018,8 @@ const BEAT_ATTACKS = {
   beamDown: e => shootDown(laneX(e.x), e.shake),
   bomb: () => throwBomb(),
   spinner: e => launchSpinner({
-    dur: e.dur, rev: e.rev, spin: e.spin, tiltScreen: e.tiltScreen, aim: e.aim, doubleSided: e.doubleSided,
+    dur: e.dur, rev: e.rev, spin: e.spin, tiltScreen: e.tiltScreen, aim: e.aim,
+    doubleSided: e.doubleSided, arms: e.arms,
   }),
   // boss movement cues (not attacks)
   tilt: e => { camera.target = e.dir; camera.hold = CAMERA.hold; camera.stiffness = CAMERA.stiffness; }, // screen sways
@@ -1004,6 +1205,7 @@ function updateFight(dt) {
   }
 
   if (spinner) updateSpinner(dt);
+  updateRockets(dt);
 
   // beams: charge (outline only), fire (damaging, once per beam), then dissipate into sparks
   for (let i = beams.length - 1; i >= 0; i--) {
@@ -1011,11 +1213,16 @@ function updateFight(dt) {
     b.t += dt;
     if (!b.fired && b.t >= BEAM.charge) {
       b.fired = true;
+      spawnBeamBurst(b, b.dir === 1 ? 0 : canvas.height, b.dir, false); // puff where it starts
       if (b.shake) {
         camera.target = (b.x < canvas.width / 2 ? -1 : 1) * b.shake;
         camera.hold = CAMERA.hold;
         camera.stiffness = CAMERA.stiffness;
       }
+    }
+    if (!b.landed && b.t >= BEAM.charge + BEAM.sweep) {
+      b.landed = true;
+      spawnBeamBurst(b, b.dir === 1 ? canvas.height : 0, -b.dir, true); // splash where its tip hits the far edge
     }
     if (b.t >= BEAM.charge + BEAM.fire) {
       spawnBeamSparks(b);
@@ -1033,6 +1240,8 @@ function updateFight(dt) {
     if (s.age >= s.life) { sparks.splice(i, 1); continue; }
     const drag = Math.exp(-1.5 * dt);
     s.vx *= drag; s.vy *= drag;
+    if (s.g) s.vy += s.g * dt;
+    if (s.gx) s.vx += s.gx * dt;
     s.x += s.vx * dt; s.y += s.vy * dt;
   }
 
@@ -1325,6 +1534,8 @@ function drawFight() {
   }
   ctx.restore();
 
+  drawRockets();
+
   // player (hitbox is a circle of radius player.r fitted to the sprite)
   // thrusters follow the vertical keys: W = up sprite, S = down sprite, otherwise idle
   const up = keys.has('KeyW'), down = keys.has('KeyS');
@@ -1434,7 +1645,9 @@ function drawMudBall(x, y, r, heading = Math.PI, red = 0) {
 }
 
 function drawBeams() {
-  const H = canvas.height;
+  // drawn well past the top and bottom edges so their ends never show when the screen sways or shakes
+  // (hits are still only checked on screen)
+  const top = -BEAM_OVERDRAW, H = canvas.height + 2 * BEAM_OVERDRAW;
   for (const b of beams) {
     const x0 = b.x - BEAM.w / 2;
     if (b.t < BEAM.charge) {
@@ -1442,12 +1655,12 @@ function drawBeams() {
       const p = b.t / BEAM.charge;
       ctx.fillStyle = MUD.mid;
       ctx.globalAlpha = 0.06 + 0.12 * p;
-      ctx.fillRect(x0, 0, BEAM.w, H);
+      ctx.fillRect(x0, top, BEAM.w, H);
       ctx.globalAlpha = 0.5 + 0.4 * Math.sin(b.t * (10 + 20 * p));
       ctx.strokeStyle = MUD.deep;
       ctx.lineWidth = 2;
       ctx.setLineDash([12, 8]);
-      ctx.strokeRect(x0, 1, BEAM.w, H - 2);
+      ctx.strokeRect(x0, top, BEAM.w, H);
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
     } else {
@@ -1461,7 +1674,7 @@ function drawBeams() {
       ctx.shadowColor = MUD.mid;
       ctx.shadowBlur = 20;
       ctx.fillStyle = g;
-      ctx.fillRect(x0, b.dir === 1 ? 0 : H * (1 - p), BEAM.w, H * p);
+      ctx.fillRect(x0, b.dir === 1 ? top : top + H * (1 - p), BEAM.w, H * p);
       ctx.restore();
     }
   }
@@ -1490,28 +1703,65 @@ function drawSpinner() {
     ctx.save();
     ctx.translate(s.x, s.y);
     ctx.rotate(s.angle);
-    ctx.globalAlpha = Math.min(1, lt / SPINNER.fadeIn);
     ctx.shadowColor = MUD.mid;
     ctx.shadowBlur = 20;
     ctx.fillStyle = g;
-    ctx.fillRect(s.doubleSided ? -SPINNER.length : 0, -W / 2, SPINNER.length * (s.doubleSided ? 2 : 1), W);
+    spinnerArms(s).forEach(({ off, fade }) => {
+      if (fade <= 0) return;
+      ctx.save();
+      ctx.rotate(off);
+      ctx.globalAlpha = fade;
+      ctx.fillRect(0, -W / 2, SPINNER.length, W);
+      ctx.restore();
+    });
     ctx.restore();
   }
 
-  // mud orb with a white center that flashes red (solid red once the laser is out)
+  // a big mud ball (same art as the thrown ones), turning with its laser, with a glowing core that flashes white to
+  // red while it charges and burns solid red once the laser is out
   const glow = lt >= 0 ? 1 : (Math.sin(s.phase * Math.PI * 2) + 1) / 2;
   const gb = Math.round(255 * (1 - glow));
-  ctx.fillStyle = MUD.mid;
+  drawMudBall(s.x, s.y, SPINNER.r, lt >= 0 ? s.angle : s.t * 4);
+  const core = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, SPINNER.coreR * 1.6);
+  core.addColorStop(0, `rgb(255, ${Math.min(255, gb + 90)}, ${Math.min(255, gb + 90)})`);
+  core.addColorStop(0.55, `rgb(255, ${gb}, ${gb})`);
+  core.addColorStop(1, 'rgba(255, 60, 40, 0)');
+  ctx.fillStyle = core;
   ctx.beginPath();
-  ctx.arc(s.x, s.y, SPINNER.r, 0, Math.PI * 2);
+  ctx.arc(s.x, s.y, SPINNER.coreR * 1.6, 0, Math.PI * 2);
   ctx.fill();
-  ctx.strokeStyle = MUD.dark;
-  ctx.lineWidth = 3;
-  ctx.stroke();
-  ctx.fillStyle = `rgb(255, ${gb}, ${gb})`;
-  ctx.beginPath();
-  ctx.arc(s.x, s.y, SPINNER.coreR, 0, Math.PI * 2);
-  ctx.fill();
+
+  if (lt < 0) drawSpinDirection(s);
+}
+
+// while a spinner is charging: a flashing yellow curved arrow around it, pointing the way its laser will first turn
+// (angles grow clockwise on the canvas, so dir = 1 is clockwise)
+function drawSpinDirection(s) {
+  if (Math.floor(s.t * 6) % 2 === 1) return; // flash
+  const r = SPINNER.r + 11, span = 1.6, start = -Math.PI / 2 - (s.dir * span) / 2, end = start + s.dir * span;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const [color, width] of [[MUD.dark, 8], ['#ffd23f', 4]]) { // dark outline under the yellow so it reads anywhere
+    ctx.strokeStyle = ctx.fillStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, r, start, end, s.dir < 0);
+    ctx.stroke();
+    // arrowhead at the end of the arc, pointing along the turn
+    const hx = s.x + Math.cos(end) * r, hy = s.y + Math.sin(end) * r;
+    const tx = -Math.sin(end) * s.dir, ty = Math.cos(end) * s.dir; // tangent in the turning direction
+    const nx = Math.cos(end), ny = Math.sin(end), len = 9, half = 6;
+    ctx.beginPath();
+    ctx.moveTo(hx + tx * len, hy + ty * len);
+    ctx.lineTo(hx + nx * half, hy + ny * half);
+    ctx.lineTo(hx - nx * half, hy - ny * half);
+    ctx.closePath();
+    ctx.lineWidth = width - 3;
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawHud() {
