@@ -316,10 +316,124 @@ function drawFightBackground() {
   if (!b) return;
   if (loaded(b.skyImg)) drawLayer(b.skyImg, fightSkyScroll);
   drawVisualizer(); // between the sky and the grass, so the grass hides the bars' feet
+  drawGodRays();    // sunbeams and the far light motes, behind the grass too
+  drawMotes(false);
   if (loaded(b.groundImg)) {
     // centered, and still
     drawLayer(b.groundImg, (layerPattern(b.groundImg).w - canvas.width) / 2);
   }
+}
+
+// ---- fantasy lighting: sunbeams through the sky, drifting light motes, a halo on the cat, and a warm glow + soft
+// purple vignette over the whole arena. It breathes with the music: brighter as the song gets more intense.
+const LIGHT = {
+  source: { x: 140, y: -260 },  // where the sunbeams come from (above the top-left)
+  rays: 6,
+  rayAlpha: 0.24,               // brightest a sunbeam gets
+  motes: 46,                    // floating specks of light (about a third drift in front of the action)
+  vignette: 'rgba(58, 22, 70, 0.32)',
+  warmAlpha: 0.22,              // strength of the golden bloom from the light source
+};
+const motes = [];
+let lightTime = 0;
+
+function resetLighting() {
+  motes.length = 0;
+  for (let i = 0; i < LIGHT.motes; i++) {
+    motes.push({
+      x: Math.random() * canvas.width, y: Math.random() * canvas.height,
+      r: 1.5 + Math.random() * 3, rise: 8 + Math.random() * 22, phase: Math.random() * 6.3,
+      front: i % 3 === 0, hue: Math.random() < 0.6 ? '255, 244, 205' : '240, 214, 255', // gold or lavender
+    });
+  }
+}
+
+function updateLighting(dt) {
+  lightTime += dt;
+  for (const m of motes) {
+    m.y -= m.rise * dt;
+    m.x += Math.sin(lightTime * 0.7 + m.phase) * 12 * dt;
+    if (m.y < -10) { m.y = canvas.height + 10; m.x = Math.random() * canvas.width; }
+  }
+}
+
+// how lit up the scene is right now: a base glow plus the song's intensity plus a little lift on each kick
+const lightLevel = () => 0.6 + 0.35 * songIntensity + 0.15 * boss.pulse;
+
+function drawGodRays() {
+  const { x: sx, y: sy } = LIGHT.source, level = lightLevel();
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  for (let i = 0; i < LIGHT.rays; i++) {
+    const angle = 0.55 + i * 0.16 + Math.sin(lightTime * 0.25 + i * 1.7) * 0.03; // fanning down to the right
+    const len = 1100, width = 40 + (i % 3) * 30;
+    const shimmer = 0.6 + 0.4 * Math.sin(lightTime * 0.8 + i * 2.1);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(angle);
+    const g = ctx.createLinearGradient(0, 0, len, 0);
+    g.addColorStop(0, `rgba(255, 246, 215, ${LIGHT.rayAlpha * level * shimmer})`);
+    g.addColorStop(1, 'rgba(255, 246, 215, 0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); // widening shaft
+    ctx.moveTo(0, -width * 0.2);
+    ctx.lineTo(len, -width);
+    ctx.lineTo(len, width);
+    ctx.lineTo(0, width * 0.2);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+// soft glowing specks; `front` = the ones drifting in front of the action
+function drawMotes(front) {
+  const level = lightLevel();
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of motes) {
+    if (m.front !== front) continue;
+    const twinkle = 0.5 + 0.5 * Math.sin(lightTime * 2.3 + m.phase * 3);
+    const r = m.r * (front ? 2.2 : 1.4);
+    const g = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, r * 3);
+    g.addColorStop(0, `rgba(${m.hue}, ${0.55 * twinkle * level})`);
+    g.addColorStop(1, `rgba(${m.hue}, 0)`);
+    ctx.fillStyle = g;
+    ctx.fillRect(m.x - r * 3, m.y - r * 3, r * 6, r * 6);
+  }
+  ctx.restore();
+}
+
+// a soft lavender halo behind the cat
+function drawCatGlow() {
+  const r = 70;
+  const g = ctx.createRadialGradient(player.x, player.y, 0, player.x, player.y, r);
+  g.addColorStop(0, `rgba(235, 210, 255, ${0.35 * lightLevel()})`);
+  g.addColorStop(1, 'rgba(235, 210, 255, 0)');
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.fillStyle = g;
+  ctx.fillRect(player.x - r, player.y - r, r * 2, r * 2);
+  ctx.restore();
+}
+
+// over the whole arena (under the HUD): a warm bloom from the light source and a soft purple vignette at the edges
+function drawLightGrade() {
+  const W = canvas.width, H = canvas.height;
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  const warm = ctx.createRadialGradient(LIGHT.source.x, 0, 0, LIGHT.source.x, 0, W * 0.8);
+  warm.addColorStop(0, `rgba(255, 226, 170, ${LIGHT.warmAlpha * lightLevel()})`);
+  warm.addColorStop(1, 'rgba(255, 226, 170, 0)');
+  ctx.fillStyle = warm;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'multiply';
+  const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.45, W / 2, H / 2, W * 0.72);
+  vig.addColorStop(0, 'rgba(255, 255, 255, 0)');
+  vig.addColorStop(1, LIGHT.vignette);
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
 }
 
 // ---- audio visualizer: cava-style bars rising out of the grass, played back from the boss's pre-computed spectrum ----
@@ -539,6 +653,7 @@ function startFight(bossIndex) {
   resetOrbs();
   elapsed = 0;
   resetVisualizer();
+  resetLighting();
   songIntensity = 0;
   scene = 'fight';
 }
@@ -1130,6 +1245,7 @@ function updateFight(dt) {
     endTimer += dt;
   }
   updateVisualizer(dt);
+  updateLighting(dt);
 
   // win: the boss flees off the right edge
   if (fightState === 'won') boss.homeX += 800 * endTimer * dt;
@@ -1535,6 +1651,7 @@ function drawFight() {
   ctx.restore();
 
   drawRockets();
+  drawCatGlow();
 
   // player (hitbox is a circle of radius player.r fitted to the sprite)
   // thrusters follow the vertical keys: W = up sprite, S = down sprite, otherwise idle
@@ -2421,7 +2538,9 @@ function frame(now) {
       ctx.translate((Math.random() * 2 - 1) * mag, (Math.random() * 2 - 1) * mag);
     }
     drawFight();
+    drawMotes(true);
     ctx.restore();
+    drawLightGrade();
     drawFightHud();
     if (overlayVisible()) {
       updateRoundButtons(overlayButtons(), dt);
