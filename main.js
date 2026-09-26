@@ -26,19 +26,73 @@ const END_DELAY = 1.2;    // seconds of win/lose escape animation before the res
 const SHOT = { interval: 1.2, speed: 280, r: 10 };
 const BOMB = {
   r: 14,
-  minSpeed: 220, maxSpeed: 340, // launch speed range
-  drag: 1.4,                    // bombs skid to a stop (travel = speed / drag, at most ~240px)
+  minDist: 120,                 // shortest throw; the longest reaches the arena edge along the chosen direction
+  drag: 1.4,                    // bombs skid to a stop (travel = launch speed / drag)
   fuse: 2.2,                    // seconds until it explodes
   blastSpeed: 240,              // speed of the 8 projectiles it releases
   spread: 65 * Math.PI / 180,   // valid throw cone: +/- this from straight left
 };
+// vertical beam: outlined column charges, then a fast beam sweeps across it, then it dissipates into harmless sparks
+const BEAM = {
+  w: 56,
+  charge: 1.0,  // seconds the outline warns of the column
+  sweep: 0.08,  // seconds for the beam to shoot across the screen
+  fire: 0.3,    // total seconds the beam is live (damaging)
+  sparks: 40,
+};
 const shots = []; // { x, y, vx, vy }
+const beams = []; // { x, dir (1 = down, -1 = up), t, hit }
+const sparks = []; // { x, y, vx, vy, age, life, size, color }
+
+// spinner: a purple orb is thrown into the arena, its white center flashes red faster and faster,
+// then it fires a laser that spins around it. Only one can exist at a time.
+const SPINNER = {
+  r: 30, coreR: 13,
+  drag: 2.5,          // skid to a stop (travel = launch speed / drag)
+  margin: 120,        // it always lands at least this far from the left, top and bottom borders and the boss's column
+  fuse: 2.0,          // seconds of flashing before the laser
+  fadeIn: 0.25,       // the laser fades in and can't hurt until it's fully visible
+  laser: 3.0,         // seconds the laser spins
+  spin: 1.12,         // radians per second
+  length: Math.hypot(canvas.width, canvas.height), // long enough to cross the whole arena from anywhere in it
+  width: 18,
+  hitCooldown: 0.8,   // after a hit, the laser can't hurt again for this long
+};
+let spinner = null; // { x, y, vx, vy, t, phase, firing, angle0, angle, dir, cool }
 const bombs = []; // { x, y, vx, vy, t, phase }
 let attackTimer = 0;
 
+// offense: type the prompt while dodging (right-side QWERTY letters only, never WASD)
+const PROMPT = {
+  pool: 'YUIOPHJKLNM',
+  length: 5,
+  time: 5,          // seconds before an untyped prompt disappears
+  errorTime: 0.5,   // wrong key: prompt flashes red and shakes, input locked this long
+  minGap: 3, maxGap: 8, // random pause between prompts
+};
+// a completed prompt makes the boss shake, then hold fire for a moment
+const BOSS_STUN = { shake: 0.5, ceasefire: 1.5 };
+const CALLOUT = { flash: 3, fade: 0.5 }; // combo callout flashes, then fades
+// points for a completed prompt = 100 x the combo length it extends to (1st = 100, 2nd = 200, ...),
+// so a combo of n prompts is worth 100 * n * (n + 1) / 2 in total
+const POINTS_PER_PROMPT = 100;
+const promptPoints = combo => POINTS_PER_PROMPT * combo;
+const comboCallout = n => n === 2 ? 'Double!' : n === 3 ? 'TRIPLE!' : n === 4 ? 'QUADRUPLE!!!' : n > 4 ? `${n}x COMBO!!!` : null;
+
 const BOSS_HOME_X = canvas.width - 120;
-const player = { x: 200, y: canvas.height / 2, vx: 0, vy: 0, r: 14, accel: 1600, friction: 6, maxSpeed: 320 };
-const boss = { x: BOSS_HOME_X, y: canvas.height / 2, rx: 60, ry: 110, color: '#d65db1', name: '' };
+const catImgs = {};
+for (const pose of ['idle', 'up', 'down']) {
+  catImgs[pose] = new Image();
+  catImgs[pose].src = `assets/cat_${pose}.png`;
+}
+const heartImg = new Image();
+heartImg.src = 'assets/hearts.png';
+const CAT_SIZE = 64; // drawn size in px
+const CAT_MAX_TILT = 20 * Math.PI / 180; // lean at full horizontal speed (right = clockwise)
+const CAT_HITBOX = 0.43; // hitbox radius as a fraction of the size (the helmet fills ~86% of the image)
+
+const player = { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0, r: CAT_SIZE * CAT_HITBOX, accel: 1600, friction: 6, maxSpeed: 320 };
+const boss = { x: BOSS_HOME_X, y: canvas.height / 2, rx: 60, ry: 110, color: '#d65db1', name: '', shakeT: 0, ceaseT: 0 };
 // placeholder names and colors, one per boss/song
 const BOSSES = [
   { name: 'Sir Woofington', color: '#d65db1' },
@@ -50,16 +104,16 @@ const health = { hp: MAX_HP, regenTimer: 0 };
 let regen = null; // { t, angle } while a health point is about to reappear
 // orbs glide freely: they only get pulled in once they drift past the leash, and the farther out they are the faster they move
 const ORBIT = {
-  radius: 34,      // comfortable distance; inside this they mostly idle
+  radius: 54,      // comfortable distance; inside this they mostly idle
   far: 130,        // distance at which orbs reach full speed
   minSpeed: 6,     // top speed right next to the player (nearly stationary)
   maxSpeed: 420,   // top speed when far behind
   pull: 26,        // acceleration toward the player per px beyond the radius
   wander: 22,      // idle drift acceleration
   padding: 3,      // guaranteed gap between orb edges
-  spacing: 20,     // orbs start gently pushing apart inside this center distance
+  spacing: 32,     // orbs start gently pushing apart inside this center distance
   drag: 2.5,
-  r: 6,
+  r: 12,           // half the drawn size of a heart
 };
 const orbs = [];
 function resetOrbs() {
@@ -82,7 +136,12 @@ addEventListener('keyup', e => keys.delete(e.code));
 let elapsed = 0;
 let fightState = 'playing'; // 'playing' | 'paused' | 'won' | 'lost'
 let endTimer = 0; // seconds since the fight ended
-let score = 0; // nothing awards points yet
+let score = 0;
+let combo = 0;         // consecutive completed prompts since the last hit taken
+let maxCombo = 0;      // highest combo reached this fight
+let callout = null;    // { text, t } combo text on screen
+let typing = null;     // { chars, typed, t, errorT } the active prompt
+let promptTimer = 0;   // seconds until the next prompt appears
 
 const fightEnded = () => fightState === 'won' || fightState === 'lost';
 // pause panel shows immediately, win/lose panels wait for the escape animation
@@ -96,8 +155,17 @@ function startFight(bossIndex) {
   regen = null;
   shots.length = 0;
   bombs.length = 0;
+  beams.length = 0;
+  sparks.length = 0;
+  spinner = null;
   attackTimer = 0;
-  Object.assign(player, { x: 200, y: canvas.height / 2, vx: 0, vy: 0 });
+  Object.assign(boss, { shakeT: 0, ceaseT: 0 });
+  combo = 0;
+  maxCombo = 0;
+  callout = null;
+  typing = null;
+  promptTimer = randomPromptGap();
+  Object.assign(player, { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0 });
   Object.assign(health, { hp: MAX_HP, regenTimer: 0 });
   resetOrbs();
   elapsed = 0;
@@ -108,6 +176,42 @@ function endFight(result) {
   fightState = result;
   endTimer = 0;
   regen = null;
+  typing = null;
+}
+
+// ---- offense: typing prompt ----
+const randomPromptGap = () => PROMPT.minGap + Math.random() * (PROMPT.maxGap - PROMPT.minGap);
+
+function spawnPrompt() {
+  let chars = '';
+  while (chars.length < PROMPT.length) {
+    const c = PROMPT.pool[Math.floor(Math.random() * PROMPT.pool.length)];
+    if (c !== chars[chars.length - 1]) chars += c; // no doubled letters
+  }
+  typing = { chars, typed: 0, t: 0, errorT: 0 };
+}
+
+function typePromptKey(code) {
+  if (!typing || typing.errorT > 0 || !code.startsWith('Key')) return;
+  const ch = code.slice(3);
+  if (!PROMPT.pool.includes(ch)) return; // WASD and any other key are ignored
+  if (ch === typing.chars[typing.typed]) {
+    if (++typing.typed === typing.chars.length) completePrompt();
+  } else {
+    typing.errorT = PROMPT.errorTime; // progress is kept, input resumes after the lockout
+  }
+}
+
+function completePrompt() {
+  combo++;
+  maxCombo = Math.max(maxCombo, combo);
+  score += promptPoints(combo);
+  const text = comboCallout(combo);
+  callout = text ? { text, t: 0 } : null;
+  boss.shakeT = BOSS_STUN.shake;
+  boss.ceaseT = BOSS_STUN.ceasefire;
+  typing = null;
+  promptTimer = randomPromptGap();
 }
 
 // ---- boss attacks ----
@@ -127,17 +231,53 @@ const shootRandomAngle = () => shoot((Math.floor(Math.random() * (2 * SHOOT_MAX 
 
 // vertical shots sweep a column of the arena: up from the bottom edge, down from the top edge
 const randomLane = () => 40 + Math.random() * (BOSS_HOME_X - boss.rx - 80);
-function shootUp(x = randomLane()) {
-  fireShot(x, canvas.height + SHOT.r, 0, -SHOT.speed);
+function shootBeam(dir, x = randomLane()) {
+  beams.push({ x, dir, t: 0, hit: false });
 }
-function shootDown(x = randomLane()) {
-  fireShot(x, -SHOT.r, 0, SHOT.speed);
+const shootDown = x => shootBeam(1, x);  // sweeps from the top edge down
+const shootUp = x => shootBeam(-1, x);   // sweeps from the bottom edge up
+
+// leftover energy drifting off the column once a beam ends
+function spawnBeamSparks(b) {
+  for (let i = 0; i < BEAM.sparks; i++) {
+    const x = b.x + (Math.random() - 0.5) * BEAM.w;
+    sparks.push({
+      x, y: Math.random() * canvas.height,
+      vx: ((x - b.x) / (BEAM.w / 2)) * 70 + (Math.random() - 0.5) * 60,
+      vy: (Math.random() - 0.5) * 80,
+      age: 0, life: 0.8 + Math.random() * 0.6,
+      size: 3 + Math.random() * 4,
+      color: Math.random() < 0.5 ? COLOR.purple : COLOR.orb,
+    });
+  }
+}
+
+// circle (player) vs the part of the beam that has been swept so far
+function beamHitsPlayer(b) {
+  const p = Math.min(1, (b.t - BEAM.charge) / BEAM.sweep);
+  const y0 = b.dir === 1 ? 0 : canvas.height * (1 - p);
+  const y1 = b.dir === 1 ? canvas.height * p : canvas.height;
+  const cx = Math.max(b.x - BEAM.w / 2, Math.min(b.x + BEAM.w / 2, player.x));
+  const cy = Math.max(y0, Math.min(y1, player.y));
+  return Math.hypot(player.x - cx, player.y - cy) < player.r;
 }
 
 // a valid direction is anywhere in the cone pointing left, into the arena (never behind or into the boss)
 function throwBomb() {
   const angle = Math.PI + (Math.random() * 2 - 1) * BOMB.spread;
-  const speed = BOMB.minSpeed + Math.random() * (BOMB.maxSpeed - BOMB.minSpeed);
+  const dx = Math.cos(angle), dy = Math.sin(angle);
+
+  // distance to the arena edge along this direction (left wall, and the top or bottom wall)
+  const top = BAR.y + BAR.capH + BOMB.r, bottom = canvas.height - BOMB.r;
+  const toWall = Math.min(
+    (boss.x - BOMB.r) / -dx,
+    dy > 0 ? (bottom - boss.y) / dy : dy < 0 ? (boss.y - top) / -dy : Infinity,
+  );
+
+  // throw anywhere from minDist up to the wall; the launch speed is chosen so drag stops it exactly there,
+  // so it can never reach an edge (no bouncing, no clamping)
+  const dist = Math.min(toWall, BOMB.minDist + Math.random() * (toWall - BOMB.minDist));
+  const speed = dist * BOMB.drag;
   bombs.push({ x: boss.x, y: boss.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, t: 0, phase: 0 });
 }
 
@@ -149,7 +289,78 @@ function explodeBomb(b) {
   }
 }
 
-const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb];
+// throws the spinner to a random spot at least SPINNER.margin from the borders (skips if one is already out)
+function launchSpinner() {
+  if (spinner) return;
+  const m = SPINNER.margin;
+  const top = BAR.y + BAR.capH + m;
+  const tx = m + Math.random() * (BOSS_HOME_X - boss.rx - 2 * m);
+  const ty = top + Math.random() * (canvas.height - m - top);
+  const dx = tx - boss.x, dy = ty - boss.y;
+  const dist = Math.hypot(dx, dy);
+  const speed = dist * SPINNER.drag; // drag stops it at the target
+  spinner = {
+    x: boss.x, y: boss.y, vx: (dx / dist) * speed, vy: (dy / dist) * speed,
+    t: 0, phase: 0, firing: false, angle0: 0, angle: 0,
+    dir: Math.random() < 0.5 ? 1 : -1, cool: 0,
+  };
+}
+
+function updateSpinner(dt) {
+  const s = spinner;
+  s.t += dt;
+  const drag = Math.exp(-SPINNER.drag * dt);
+  s.vx *= drag; s.vy *= drag;
+  s.x += s.vx * dt; s.y += s.vy * dt;
+
+  // the orb itself hurts on contact (shares the laser's hit cooldown)
+  s.cool = Math.max(0, s.cool - dt);
+  if (fightState === 'playing' && s.cool <= 0 && Math.hypot(s.x - player.x, s.y - player.y) < SPINNER.r + player.r) {
+    damagePlayer();
+    s.cool = SPINNER.hitCooldown;
+  }
+
+  if (s.t < SPINNER.fuse) {
+    const u = s.t / SPINNER.fuse;
+    s.phase += (2 + 16 * u * u) * dt; // flashes per second, ramping up
+    return;
+  }
+
+  if (!s.firing) {
+    // laser starts somewhere the player isn't, and sweeps toward where they were
+    s.firing = true;
+    s.vx = s.vy = 0;
+    const toPlayer = Math.atan2(player.y - s.y, player.x - s.x);
+    s.angle0 = toPlayer - s.dir * (0.9 + Math.random() * (Math.PI - 0.9));
+  }
+  const lt = s.t - SPINNER.fuse;
+  if (lt >= SPINNER.laser) {
+    spinner = null;
+    return;
+  }
+  s.angle = s.angle0 + s.dir * SPINNER.spin * lt;
+  if (fightState === 'playing' && lt >= SPINNER.fadeIn && s.cool <= 0 && laserHitsPlayer(s)) {
+    damagePlayer();
+    s.cool = SPINNER.hitCooldown;
+  }
+}
+
+// player circle vs the laser segment
+function laserHitsPlayer(s) {
+  const ex = Math.cos(s.angle) * SPINNER.length, ey = Math.sin(s.angle) * SPINNER.length;
+  const px = player.x - s.x, py = player.y - s.y;
+  const t = Math.max(0, Math.min(1, (px * ex + py * ey) / (ex * ex + ey * ey)));
+  return Math.hypot(px - ex * t, py - ey * t) < player.r + SPINNER.width / 2;
+}
+
+const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb, launchSpinner];
+
+function damagePlayer() {
+  health.hp = Math.max(0, health.hp - 1);
+  health.regenTimer = 0; // regen clock restarts on a hit
+  combo = 0;
+  callout = null;
+}
 
 function updateFight(dt) {
   const playing = fightState === 'playing';
@@ -163,12 +374,35 @@ function updateFight(dt) {
   // win: the boss flees off the right edge
   if (fightState === 'won') boss.x += 800 * endTimer * dt;
 
-  // attacks: pick a random one on a timer
+  boss.shakeT = Math.max(0, boss.shakeT - dt);
+  boss.ceaseT = Math.max(0, boss.ceaseT - dt);
+  if (callout) {
+    callout.t += dt;
+    if (callout.t >= CALLOUT.flash + CALLOUT.fade) callout = null;
+  }
+
+  // typing prompt: appears at random, disappears if not finished in time
   if (playing) {
+    if (!typing) {
+      promptTimer -= dt;
+      if (promptTimer <= 0) spawnPrompt();
+    } else {
+      typing.t += dt;
+      typing.errorT = Math.max(0, typing.errorT - dt);
+      if (typing.t >= PROMPT.time) {
+        typing = null;
+        promptTimer = randomPromptGap();
+      }
+    }
+  }
+
+  // attacks: pick a random one on a timer (held while the boss is stunned)
+  if (playing && boss.ceaseT <= 0) {
     attackTimer += dt;
     if (attackTimer >= SHOT.interval) {
       attackTimer = 0;
-      ATTACKS[Math.floor(Math.random() * ATTACKS.length)]();
+      const pool = spinner ? ATTACKS.filter(a => a !== launchSpinner) : ATTACKS; // never two spinners at once
+      pool[Math.floor(Math.random() * pool.length)]();
     }
   }
 
@@ -178,14 +412,39 @@ function updateFight(dt) {
     b.t += dt;
     const drag = Math.exp(-BOMB.drag * dt);
     b.vx *= drag; b.vy *= drag;
-    b.x = Math.max(BOMB.r, b.x + b.vx * dt);
-    b.y = Math.min(canvas.height - BOMB.r, Math.max(BAR.y + BAR.capH + BOMB.r, b.y + b.vy * dt));
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
     const urgency = b.t / BOMB.fuse;
     b.phase += (2 + 16 * urgency * urgency) * dt; // flashes per second, ramping up
     if (b.t >= BOMB.fuse) {
       explodeBomb(b);
       bombs.splice(i, 1);
     }
+  }
+
+  if (spinner) updateSpinner(dt);
+
+  // beams: charge (outline only), fire (damaging, once per beam), then dissipate into sparks
+  for (let i = beams.length - 1; i >= 0; i--) {
+    const b = beams[i];
+    b.t += dt;
+    if (b.t >= BEAM.charge + BEAM.fire) {
+      spawnBeamSparks(b);
+      beams.splice(i, 1);
+    } else if (playing && !b.hit && b.t >= BEAM.charge && beamHitsPlayer(b)) {
+      b.hit = true;
+      damagePlayer();
+    }
+  }
+
+  // sparks: drift and fade, never damaging
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s = sparks[i];
+    s.age += dt;
+    if (s.age >= s.life) { sparks.splice(i, 1); continue; }
+    const drag = Math.exp(-1.5 * dt);
+    s.vx *= drag; s.vy *= drag;
+    s.x += s.vx * dt; s.y += s.vy * dt;
   }
 
   // projectiles: move, collide with the player (they keep flying after the fight ends)
@@ -195,8 +454,7 @@ function updateFight(dt) {
     s.x += s.vx * dt;
     s.y += s.vy * dt;
     if (playing && Math.hypot(s.x - player.x, s.y - player.y) < SHOT.r + player.r) {
-      health.hp = Math.max(0, health.hp - 1);
-      health.regenTimer = 0; // regen clock restarts on a hit
+      damagePlayer();
       shots.splice(i, 1);
     } else if (s.x < -margin || s.x > canvas.width + margin || s.y < -margin || s.y > canvas.height + margin) {
       shots.splice(i, 1);
@@ -230,6 +488,10 @@ function updateFight(dt) {
 
   player.x += player.vx * dt;
   player.y += player.vy * dt;
+
+  // lean into horizontal movement, eased so it doesn't snap
+  const tiltTarget = Math.max(-1, Math.min(1, player.vx / player.maxSpeed)) * CAT_MAX_TILT;
+  player.tilt += (tiltTarget - player.tilt) * (1 - Math.exp(-12 * dt));
 
   // keep the player inside the arena, and out of the boss's column (not while escaping)
   if (fightState !== 'lost') {
@@ -340,15 +602,25 @@ const regenSpot = () => ({
   y: player.y + Math.sin(regen.angle) * ORBIT.radius,
 });
 
+// health point sprite, centered, `r` = half its drawn size (falls back to a circle until the image loads)
+function drawHeart(x, y, r) {
+  if (r < 0.5) return;
+  if (heartImg.complete && heartImg.naturalWidth) {
+    ctx.drawImage(heartImg, x - r, y - r, r * 2, r * 2);
+  } else {
+    ctx.fillStyle = COLOR.orb;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
 function drawRegenBurst() {
   const p = regen.t / REGEN_ANIM; // 0..1
   const c = regenSpot();
 
-  // orb swelling in the middle
-  ctx.fillStyle = COLOR.orb;
-  ctx.beginPath();
-  ctx.arc(c.x, c.y, ORBIT.r * p, 0, Math.PI * 2);
-  ctx.fill();
+  // heart swelling in the middle
+  drawHeart(c.x, c.y, ORBIT.r * p);
 
   // short lines flying outward
   ctx.strokeStyle = COLOR.purple;
@@ -368,7 +640,7 @@ function drawRegenBurst() {
 }
 
 function drawFight() {
-  // progress bar (top): |-------|------|
+  // progress bar (top): |-------■------|
   const midY = BAR.y;
   ctx.strokeStyle = COLOR.track;
   ctx.lineWidth = 2;
@@ -377,12 +649,12 @@ function drawFight() {
   ctx.moveTo(BAR.x + BAR.w, midY - BAR.capH / 2); ctx.lineTo(BAR.x + BAR.w, midY + BAR.capH / 2);
   ctx.moveTo(BAR.x, midY); ctx.lineTo(BAR.x + BAR.w, midY);
   ctx.stroke();
-  ctx.strokeStyle = COLOR.purple;
-  ctx.lineWidth = 3;
   const markX = BAR.x + BAR.w * (elapsed / SONG_LENGTH);
-  ctx.beginPath();
-  ctx.moveTo(markX, midY - BAR.capH / 2); ctx.lineTo(markX, midY + BAR.capH / 2);
-  ctx.stroke();
+  ctx.fillStyle = COLOR.purple;
+  ctx.fillRect(markX - 5, midY - 5, 10, 10);
+
+  drawBeams();
+  drawSpinner();
 
   // bombs: black, flashing red (drawn before the boss so they emerge from behind it)
   for (const b of bombs) {
@@ -404,26 +676,178 @@ function drawFight() {
     ctx.stroke();
   }
 
-  // boss
-  ctx.fillStyle = boss.color;
+  // boss (shakes and flashes white when a prompt lands)
+  const hit = boss.shakeT > 0;
+  ctx.fillStyle = hit && Math.floor(boss.shakeT * 20) % 2 === 0 ? COLOR.white : boss.color;
   ctx.beginPath();
-  ctx.ellipse(boss.x, boss.y, boss.rx, boss.ry, 0, 0, Math.PI * 2);
+  ctx.ellipse(boss.x + (hit ? Math.sin(boss.shakeT * 90) * 8 : 0), boss.y, boss.rx, boss.ry, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  // player
-  ctx.fillStyle = COLOR.ink;
-  ctx.beginPath();
-  ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
-  ctx.fill();
-
-  // health orbs
-  ctx.fillStyle = COLOR.orb;
-  for (let i = 0; i < health.hp; i++) {
+  // player (hitbox is a circle of radius player.r fitted to the sprite)
+  // thrusters follow the vertical keys: W = up sprite, S = down sprite, otherwise idle
+  const up = keys.has('KeyW'), down = keys.has('KeyS');
+  const catImg = fightState === 'playing' && up !== down ? catImgs[up ? 'up' : 'down'] : catImgs.idle;
+  if (catImg.complete && catImg.naturalWidth) {
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(player.tilt);
+    ctx.drawImage(catImg, -CAT_SIZE / 2, -CAT_SIZE / 2, CAT_SIZE, CAT_SIZE);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = COLOR.ink;
     ctx.beginPath();
-    ctx.arc(orbs[i].x, orbs[i].y, ORBIT.r, 0, Math.PI * 2);
+    ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
     ctx.fill();
   }
+
+  // health orbs
+  for (let i = 0; i < health.hp; i++) drawHeart(orbs[i].x, orbs[i].y, ORBIT.r);
   if (regen) drawRegenBurst();
+
+  drawHud();
+  if (callout) drawCallout();
+  if (typing) drawPrompt();
+}
+
+function drawBeams() {
+  const H = canvas.height;
+  for (const b of beams) {
+    const x0 = b.x - BEAM.w / 2;
+    if (b.t < BEAM.charge) {
+      // warning: dashed outline of the column, filling in and pulsing faster as it charges
+      const p = b.t / BEAM.charge;
+      ctx.fillStyle = COLOR.purple;
+      ctx.globalAlpha = 0.04 + 0.1 * p;
+      ctx.fillRect(x0, 0, BEAM.w, H);
+      ctx.globalAlpha = 0.5 + 0.4 * Math.sin(b.t * (10 + 20 * p));
+      ctx.strokeStyle = COLOR.purple;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([12, 8]);
+      ctx.strokeRect(x0, 1, BEAM.w, H - 2);
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    } else {
+      // live beam: purple edges, lavender core, swept across the column almost instantly
+      const p = Math.min(1, (b.t - BEAM.charge) / BEAM.sweep);
+      const g = ctx.createLinearGradient(x0, 0, x0 + BEAM.w, 0);
+      g.addColorStop(0, COLOR.purple);
+      g.addColorStop(0.5, COLOR.lavender);
+      g.addColorStop(1, COLOR.purple);
+      ctx.save();
+      ctx.shadowColor = COLOR.purple;
+      ctx.shadowBlur = 20;
+      ctx.fillStyle = g;
+      ctx.fillRect(x0, b.dir === 1 ? 0 : H * (1 - p), BEAM.w, H * p);
+      ctx.restore();
+    }
+  }
+
+  // dissipating sparks
+  for (const s of sparks) {
+    ctx.globalAlpha = 0.9 * Math.pow(1 - s.age / s.life, 0.6);
+    ctx.fillStyle = s.color;
+    ctx.fillRect(s.x - s.size / 2, s.y - s.size / 2, s.size, s.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawSpinner() {
+  const s = spinner;
+  if (!s) return;
+  const lt = s.t - SPINNER.fuse;
+
+  if (lt >= 0) {
+    // spinning laser: purple edges, lavender core, fades in
+    const W = SPINNER.width;
+    const g = ctx.createLinearGradient(0, -W / 2, 0, W / 2);
+    g.addColorStop(0, COLOR.purple);
+    g.addColorStop(0.5, COLOR.lavender);
+    g.addColorStop(1, COLOR.purple);
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.angle);
+    ctx.globalAlpha = Math.min(1, lt / SPINNER.fadeIn);
+    ctx.shadowColor = COLOR.purple;
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = g;
+    ctx.fillRect(0, -W / 2, SPINNER.length, W);
+    ctx.restore();
+  }
+
+  // purple orb with a white center that flashes red (solid red once the laser is out)
+  const glow = lt >= 0 ? 1 : (Math.sin(s.phase * Math.PI * 2) + 1) / 2;
+  const gb = Math.round(255 * (1 - glow));
+  ctx.fillStyle = COLOR.purple;
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, SPINNER.r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = `rgb(255, ${gb}, ${gb})`;
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, SPINNER.coreR, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawHud() {
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 24px sans-serif';
+  ctx.fillStyle = COLOR.ink;
+  ctx.fillText(`Points ${score}`, 24, 20);
+  if (combo > 0) {
+    ctx.fillStyle = COLOR.purple;
+    ctx.fillText(`Combo x${combo}`, 24, 52);
+  }
+}
+
+// combo text: flashes for CALLOUT.flash seconds, then fades out
+function drawCallout() {
+  const t = callout.t;
+  const pop = 1 + Math.max(0, 0.25 - t) * 2; // brief scale-in
+  ctx.save();
+  ctx.globalAlpha = t < CALLOUT.flash ? 1 : 1 - (t - CALLOUT.flash) / CALLOUT.fade;
+  ctx.translate(canvas.width / 2, 100);
+  ctx.scale(pop, pop);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 64px sans-serif';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 8;
+  ctx.strokeStyle = COLOR.ink;
+  ctx.strokeText(callout.text, 0, 0);
+  ctx.fillStyle = Math.floor(t * 8) % 2 === 0 ? COLOR.purple : COLOR.white;
+  ctx.fillText(callout.text, 0, 0);
+  ctx.restore();
+}
+
+// typing prompt: one box per character, timer bar underneath
+function drawPrompt() {
+  const boxW = 56, boxH = 64, gap = 10, n = typing.chars.length;
+  const w = n * boxW + (n - 1) * gap;
+  const err = typing.errorT > 0;
+  const flash = err && Math.floor(typing.errorT * 24) % 2 === 0;
+  const x0 = (canvas.width - w) / 2 + (err ? Math.sin(typing.errorT * 90) * 6 : 0);
+  const y0 = 420;
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = 'bold 36px sans-serif';
+  for (let i = 0; i < n; i++) {
+    const x = x0 + i * (boxW + gap);
+    const done = i < typing.typed, cur = i === typing.typed;
+    ctx.fillStyle = err ? (flash ? '#ff9a9a' : '#ffe3e3') : done ? COLOR.lavender : COLOR.white;
+    ctx.fillRect(x, y0, boxW, boxH);
+    ctx.strokeStyle = err ? '#e53935' : cur || done ? COLOR.purple : COLOR.track;
+    ctx.lineWidth = cur && !err ? 4 : 2;
+    ctx.strokeRect(x, y0, boxW, boxH);
+    ctx.fillStyle = err ? '#c62828' : done ? COLOR.muted : COLOR.ink;
+    ctx.fillText(typing.chars[i], x + boxW / 2, y0 + boxH / 2 + 2);
+  }
+
+  const by = y0 + boxH + 12;
+  ctx.fillStyle = COLOR.lavender;
+  ctx.fillRect(x0, by, w, 8);
+  ctx.fillStyle = err ? '#e53935' : COLOR.purple;
+  ctx.fillRect(x0, by, w * (1 - typing.t / PROMPT.time), 8);
 }
 
 // ---- menus: 'title' -> 'select' -> 'fight' ----
@@ -464,12 +888,13 @@ function onKey(code) {
     if (code === 'Escape' && fightState === 'playing') fightState = 'paused';
     else if (code === 'Escape' && fightState === 'paused') fightState = 'playing';
     else if (confirm && overlayVisible()) activateOverlayButton();
+    else if (fightState === 'playing') typePromptKey(code);
   }
 }
 
+// Enter/Space press the first (primary) button: PLAY when paused, LOBBY after a win or loss
 function activateOverlayButton() {
-  if (fightState === 'paused') fightState = 'playing';
-  else scene = 'title'; // won or lost: back to the lobby
+  overlayButtons()[0].action();
 }
 
 function mousePos(e) {
@@ -489,7 +914,9 @@ canvas.addEventListener('click', e => {
   else if (scene === 'select') {
     const i = bannerAt(mouse);
     if (i >= 0) startFight(sel = i);
-  } else if (scene === 'fight' && overlayVisible() && inRect(OVERLAY_BTN, mouse)) activateOverlayButton();
+  } else if (scene === 'fight' && overlayVisible()) {
+    overlayButtons().find(b => inRect(b.r, mouse))?.action();
+  }
 });
 
 function drawTitle() {
@@ -517,8 +944,16 @@ function drawButton(r, label) {
 }
 
 // pause / win / lose panel drawn over the frozen fight
-const PANEL = { w: 460, h: 420, x: (canvas.width - 460) / 2, y: 60 };
-const OVERLAY_BTN = { w: 220, h: 64, x: (canvas.width - 220) / 2, y: PANEL.y + PANEL.h - 90 };
+const PANEL = { w: 460, h: 450, x: (canvas.width - 460) / 2, y: 45 };
+const btnAt = y => ({ w: 220, h: 64, x: (canvas.width - 220) / 2, y: PANEL.y + y });
+const resumeFight = () => { fightState = 'playing'; };
+const goLobby = () => { scene = 'title'; };
+const PAUSE_BUTTONS = [
+  { r: btnAt(290), label: 'PLAY', action: resumeFight },
+  { r: btnAt(366), label: 'LOBBY', action: goLobby },
+];
+const END_BUTTONS = [{ r: btnAt(PANEL.h - 90), label: 'LOBBY', action: goLobby }];
+const overlayButtons = () => fightState === 'paused' ? PAUSE_BUTTONS : END_BUTTONS;
 
 function drawOverlay() {
   const won = fightState === 'won';
@@ -548,7 +983,7 @@ function drawOverlay() {
   ctx.font = 'bold 28px sans-serif';
   ctx.fillText(boss.name, cx, PANEL.y + 185);
 
-  // progress: |=====|------|
+  // progress: |=====■------|
   const bw = 320, bx = cx - bw / 2, by = PANEL.y + 225, capH = 20;
   ctx.lineWidth = 2;
   ctx.strokeStyle = COLOR.track;
@@ -562,11 +997,8 @@ function drawOverlay() {
   ctx.beginPath();
   ctx.moveTo(bx, by); ctx.lineTo(bx + bw * progress, by);
   ctx.stroke();
-  ctx.strokeStyle = COLOR.ink;
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(bx + bw * progress, by - capH / 2); ctx.lineTo(bx + bw * progress, by + capH / 2);
-  ctx.stroke();
+  ctx.fillStyle = COLOR.ink;
+  ctx.fillRect(bx + bw * progress - 6, by - 6, 12, 12);
   ctx.fillStyle = COLOR.muted;
   ctx.font = '22px sans-serif';
   ctx.fillText(`${Math.floor(progress * 100)}%`, cx, by + 32);
@@ -575,9 +1007,12 @@ function drawOverlay() {
     ctx.fillStyle = COLOR.purple;
     ctx.font = 'bold 28px sans-serif';
     ctx.fillText(`Points: ${score}`, cx, PANEL.y + 295);
+    ctx.fillStyle = COLOR.ink;
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText(`Highest combo: x${maxCombo}`, cx, PANEL.y + 332);
   }
 
-  drawButton(OVERLAY_BTN, fightState === 'paused' ? 'PLAY' : 'LOBBY');
+  for (const b of overlayButtons()) drawButton(b.r, b.label);
 }
 
 function drawSelect() {
