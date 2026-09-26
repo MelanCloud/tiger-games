@@ -105,6 +105,7 @@ const BOSS_BOB = 10; // px the boss floats up and down, one full bob every two b
 const BOSS_ROCK = 5 * Math.PI / 180; // how far the boss rocks side to side, leaning the other way on every beat
 const BOSS_DRIFT = 14; // px the boss drifts left and right every four beats (with the bob, it traces a figure-eight)
 const BOSS_SQUISH = 0.03; // how much the boss squashes wide and stretches tall, once per beat
+const BOSS_ENTRANCE = { time: 1.5, from: 260 }; // at the start of a fight it fades in, sliding in from `from` px right
 const BOSS_HOP = 10; // px the boss hops on a bass kick
 
 // Whole-screen sway on beat-map tilts: the view rolls and slides toward each side, swinging smoothly between them
@@ -117,13 +118,31 @@ const CAMERA = {
   slowStiffness: 1.5,        // for the very slow lean against a `tiltScreen` spinner's laser
 };
 const camera = { sway: 0, vel: 0, target: 0, hold: 0, stiffness: CAMERA.stiffness, beat: 0 }; // sway: -1 (left) .. 1 (right)
-const BEAT_NUDGE = { size: 0.2, time: 0.35 }; // every other beat: a small sway (fraction of a full one), over this long
+// every other beat: a small sway (fraction of a full one) lasting `time` seconds. Its size follows how intense the song
+// is right now: `min` in the calm parts (always there), up to `max` at its loudest, eased over `settle` seconds so it
+// builds up and calms down smoothly.
+const BEAT_NUDGE = { min: 0.12, max: 0.34, time: 0.35, settle: 1.2 };
+let songIntensity = 0; // 0 (quietest) .. 1 (loudest), smoothed
 
-// every other beat the view nudges slightly to one side and eases back, alternating sides; `beats` = song position in beats
-function updateBeatNudge(beats) {
+// every other beat the view nudges to one side and eases back, alternating sides; `beats` = song position in beats
+function updateBeatNudge(beats, dt) {
+  const target = intensityAt(elapsed);
+  songIntensity += (target - songIntensity) * Math.min(1, dt / BEAT_NUDGE.settle);
   const cycle = Math.floor(beats / 2), since = (beats - cycle * 2) * (beatmap ? 60 / beatmap.bpm : 0.5);
   const u = Math.min(1, since / BEAT_NUDGE.time);
-  camera.beat = Math.sin(Math.PI * u) ** 2 * BEAT_NUDGE.size * (cycle % 2 ? 1 : -1);
+  const size = BEAT_NUDGE.min + (BEAT_NUDGE.max - BEAT_NUDGE.min) * songIntensity;
+  camera.beat = Math.sin(Math.PI * u) ** 2 * size * (cycle % 2 ? 1 : -1);
+}
+
+// how intense the song is at time t, from the beat-map's per-bar loudness: 0 in quiet parts .. 1 in the loudest
+// (bars below INTENSITY_FLOOR count as calm)
+const INTENSITY_FLOOR = 0.35;
+function intensityAt(t) {
+  const levels = beatmap?.intensity;
+  if (!levels) return 0.5;
+  const bar = Math.floor((t - beatmap.offset) / ((4 * 60) / beatmap.bpm));
+  const v = levels[Math.max(0, Math.min(levels.length - 1, bar))];
+  return Math.max(0, (v - INTENSITY_FLOOR) / (1 - INTENSITY_FLOOR));
 }
 
 function updateCamera(dt) {
@@ -228,7 +247,7 @@ const CAT_HITBOX = 0.43; // hitbox radius as a fraction of the size (the helmet 
 
 const player = { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0, invuln: 0, r: CAT_SIZE * CAT_HITBOX, accel: 1600, friction: 6, maxSpeed: 320 };
 const boss = { x: BOSS_HOME_X, y: canvas.height / 2, rx: 60, ry: 110, color: '#d65db1', name: '', shakeT: 0, ceaseT: 0,
-  pulse: 0, rock: 0, squish: 0, homeX: BOSS_HOME_X };
+  pulse: 0, rock: 0, squish: 0, homeX: BOSS_HOME_X, alpha: 1 };
 // placeholder names and colors, one per boss/song
 const BOSSES = [
   {
@@ -515,6 +534,7 @@ function startFight(bossIndex) {
   resetOrbs();
   elapsed = 0;
   resetVisualizer();
+  songIntensity = 0;
   scene = 'fight';
 }
 
@@ -575,15 +595,15 @@ function completePrompt() {
 // ---- boss attacks ----
 // `thrown` = thrown by the boss (fast start, curves toward the player); `falls` = from a bomb burst (steady speed,
 // pulled slowly down by gravity). Nothing else curves or falls.
-function fireShot(x, y, vx, vy, { thrown = false, falls = false } = {}) {
-  shots.push({ x, y, vx, vy, trail: [], thrown, falls, age: 0 });
+function fireShot(x, y, vx, vy, { thrown = false, falls = false, straight = false } = {}) {
+  shots.push({ x, y, vx, vy, trail: [], thrown, falls, straight, age: 0 });
 }
 
 function steerThrownShot(s, dt) {
   s.age += dt;
   const speed = SHOT.cruiseSpeed + (SHOT.launchSpeed - SHOT.cruiseSpeed) * Math.exp(-s.age / SHOT.easeTime);
   let heading = Math.atan2(s.vy, s.vx);
-  if (fightState === 'playing') {
+  if (fightState === 'playing' && !s.straight) {
     // turn a little toward the cat, but only while it's still ahead (so balls never boomerang back)
     let diff = Math.atan2(player.y - s.y, player.x - s.x) - heading;
     diff = Math.atan2(Math.sin(diff), Math.cos(diff));
@@ -621,20 +641,23 @@ function drawTrail(o, r) {
 // out of the boss's center, heading left, tilted by `degrees` (0 = horizontal, + = up, - = down)
 // snapped to 15 degree steps and limited to +/-75 so it always heads into the arena
 const SHOOT_STEP = 15, SHOOT_MAX = 75;
-function shoot(degrees = 0) {
+// `straight`: no curving toward the player, and thrown from the exact middle height of the arena
+function shoot(degrees = 0, straight = false) {
   const snapped = Math.max(-SHOOT_MAX, Math.min(SHOOT_MAX, Math.round(degrees / SHOOT_STEP) * SHOOT_STEP));
   const rad = snapped * Math.PI / 180;
-  fireShot(boss.x, boss.y, -Math.cos(rad) * SHOT.speed, -Math.sin(rad) * SHOT.speed, { thrown: true });
+  fireShot(boss.x, straight ? BOSS_HOME_Y : boss.y, -Math.cos(rad) * SHOT.speed, -Math.sin(rad) * SHOT.speed,
+    { thrown: true, straight });
 }
 const shootRandomAngle = () => shoot((Math.floor(Math.random() * (2 * SHOOT_MAX / SHOOT_STEP + 1)) - SHOOT_MAX / SHOOT_STEP) * SHOOT_STEP);
 
 // vertical shots sweep a column of the arena: up from the bottom edge, down from the top edge
 const randomLane = () => 40 + Math.random() * (BOSS_HOME_X - boss.rx - 80);
-function shootBeam(dir, x = randomLane()) {
-  beams.push({ x, dir, t: 0, hit: false });
+// `shake` (optional): when it fires, the screen swings that hard (1 = a full beam-run sway) toward the beam's side
+function shootBeam(dir, x = randomLane(), shake = 0) {
+  beams.push({ x, dir, t: 0, hit: false, fired: false, shake });
 }
-const shootDown = x => shootBeam(1, x);  // sweeps from the top edge down
-const shootUp = x => shootBeam(-1, x);   // sweeps from the bottom edge up
+const shootDown = (x, shake) => shootBeam(1, x, shake);  // sweeps from the top edge down
+const shootUp = (x, shake) => shootBeam(-1, x, shake);   // sweeps from the bottom edge up
 
 // leftover energy drifting off the column once a beam ends
 function spawnBeamSparks(b) {
@@ -787,12 +810,12 @@ const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb, launchSpinner]
 // a wind-up are started that much earlier to hit on the beat.
 const laneX = x => x === undefined ? undefined : 40 + x * (BOSS_HOME_X - boss.rx - 80);
 const BEAT_ATTACKS = {
-  shoot: e => shoot(e.deg ?? 0),
+  shoot: e => shoot(e.deg ?? 0, e.straight),
   fan: e => {
-    for (let d = Math.min(e.from, e.to); d <= Math.max(e.from, e.to); d += SHOOT_STEP) shoot(d);
+    for (let d = Math.min(e.from, e.to); d <= Math.max(e.from, e.to); d += SHOOT_STEP) shoot(d, e.straight);
   },
-  beamUp: e => shootUp(laneX(e.x)),
-  beamDown: e => shootDown(laneX(e.x)),
+  beamUp: e => shootUp(laneX(e.x), e.shake),
+  beamDown: e => shootDown(laneX(e.x), e.shake),
   bomb: () => throwBomb(),
   spinner: e => launchSpinner({
     dur: e.dur, rev: e.rev, spin: e.spin, tiltScreen: e.tiltScreen, aim: e.aim, doubleSided: e.doubleSided,
@@ -914,11 +937,14 @@ function updateFight(dt) {
   // leaning fully one way on each beat and the other way on the next. Attacks come from where it is.
   const beat = beatmap ? 60 / beatmap.bpm : 0.5;
   const beats = (elapsed + endTimer - (beatmap?.offset ?? 0)) / beat;
-  boss.x = boss.homeX + Math.sin((Math.PI * beats) / 2) * BOSS_DRIFT;
+  // entrance: over the song's first moments it fades in and glides in from the right, slowing as it arrives
+  const enter = Math.min(1, elapsed / BOSS_ENTRANCE.time);
+  boss.alpha = enter;
+  boss.x = boss.homeX + Math.sin((Math.PI * beats) / 2) * BOSS_DRIFT + (1 - enter) ** 3 * BOSS_ENTRANCE.from;
   boss.y = BOSS_HOME_Y + Math.sin(Math.PI * beats) * BOSS_BOB;
   boss.rock = Math.cos(Math.PI * beats) * BOSS_ROCK;
   boss.squish = Math.cos(2 * Math.PI * beats) * BOSS_SQUISH; // + = wide and short, on each beat
-  updateBeatNudge(beats);
+  updateBeatNudge(beats, dt);
 
   updateCamera(dt);
   boss.pulse *= Math.exp(-9 * dt); // kick bounces fade out
@@ -983,6 +1009,14 @@ function updateFight(dt) {
   for (let i = beams.length - 1; i >= 0; i--) {
     const b = beams[i];
     b.t += dt;
+    if (!b.fired && b.t >= BEAM.charge) {
+      b.fired = true;
+      if (b.shake) {
+        camera.target = (b.x < canvas.width / 2 ? -1 : 1) * b.shake;
+        camera.hold = CAMERA.hold;
+        camera.stiffness = CAMERA.stiffness;
+      }
+    }
     if (b.t >= BEAM.charge + BEAM.fire) {
       spawnBeamSparks(b);
       beams.splice(i, 1);
@@ -1277,6 +1311,7 @@ function drawFight() {
     ctx.shadowBlur = 10 + 40 * charge;
   }
   const flash = hit && Math.floor(boss.shakeT * 20) % 2 === 0;
+  ctx.globalAlpha = boss.alpha;
   // beat rocking, plus a hop + swell on bass kicks, about the boss's center
   ctx.translate(bossX, bossY - BOSS_HOP * boss.pulse);
   ctx.rotate(boss.rock);

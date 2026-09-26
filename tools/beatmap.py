@@ -21,9 +21,11 @@ then placed on beats: sparse in quiet parts, denser in loud parts. The config is
     add       [{"t": s, "a": attack, ...}, ...]: extra hand-placed attacks
 
 Attacks (`t` is when the attack lands, the game starts wind-ups early so they hit on the beat):
-    shoot {deg}      shot from the boss, deg in 15 degree steps (+ = up)
-    fan {from, to}   one shot per 15 degree step between the two angles
-    beamUp / beamDown {x?}   vertical beam, x = 0..1 across the arena (random if left out); lands when it fires
+    shoot {deg, straight?}   shot from the boss, deg in 15 degree steps (+ = up); `straight` = from the exact
+                     middle height, without curving toward the player
+    fan {from, to, straight?}   one shot per 15 degree step between the two angles (`straight`: see shoot)
+    beamUp / beamDown {x?, shake?}   vertical beam, x = 0..1 across the arena (random if left out); lands when it
+                     fires. `shake` swings the screen toward the beam's side as it fires (1 = a full beam-run sway)
     bomb             lands when it explodes
     spinner {dur?, rev?, spin?, tiltScreen?, aim?, doubleSided?}   lands when the laser starts; optional laser
                      length, seconds into the laser when it reverses (a number or a list), spin speed (radians per
@@ -256,7 +258,7 @@ def generate(song, cfg):
 
     for d in drops:
         # the drop: a full fan of shots on the beat (plus two beams, unless the drop bar already has its 4-beam run)
-        add(d['drop'], 'fan', **{'from': -75, 'to': 75})
+        add(d['drop'], 'fan', **{'from': -75, 'to': 75}, straight=True)  # no curving, so the beams stay the focus
         drop_bar = min(range(len(song['bars'])), key=lambda i: abs(song['bars'][i][0] - d['drop']))
         if drop_bar not in quad_bars:
             add(d['drop'], 'beamUp', x=0.3)
@@ -269,7 +271,10 @@ def generate(song, cfg):
 
     return {
         'id': cfg['id'], 'bpm': song['bpm'], 'offset': round(song['offset'], 3),
-        'duration': round(song['duration'], 3), 'drops': drops, 'sections': sections, 'events': events,
+        'duration': round(song['duration'], 3), 'drops': drops, 'sections': sections,
+        # how loud each bar is, 0..1 (1 = the loudest bar), for effects that follow the song's energy
+        'intensity': [round(float(v), 2) for v in song['bar_level']],
+        'events': events,
     }
 
 
@@ -290,7 +295,9 @@ def main():
         # one entry per line so the file stays easy to read and diff
         fields = []
         for key, val in beatmap.items():
-            if isinstance(val, list):
+            if key == 'intensity':
+                fields.append(f'  {json.dumps(key)}: {json.dumps(val)}')
+            elif isinstance(val, list):
                 rows = ',\n'.join('    ' + json.dumps(v) for v in val)
                 fields.append(f'  {json.dumps(key)}: [\n{rows}\n  ]')
             else:
