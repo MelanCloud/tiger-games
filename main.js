@@ -1,3 +1,6 @@
+// canvas text doesn't trigger web font loading by itself; ask for the weights used (text falls back until it arrives)
+for (const spec of ['bold 24px Fredoka', '22px Fredoka']) document.fonts.load(spec);
+
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
@@ -13,7 +16,8 @@ const COLOR = {
   ink: '#3d2b6b',     // main text, player
 };
 
-const SONG_LENGTH = 30; // seconds, placeholder until real audio exists
+const FALLBACK_SONG_LENGTH = 30; // seconds, for a boss with no song (or one that fails to load)
+const MUSIC_VOLUME = 0.7;
 const BAR = { w: (canvas.width - 80) / 4, y: 24, capH: 14 };
 BAR.x = (canvas.width - BAR.w) / 2; // centered
 
@@ -59,6 +63,11 @@ const SPINNER = {
   hitCooldown: 0.8,   // after a hit, the laser can't hurt again for this long
 };
 let spinner = null; // { x, y, vx, vy, t, phase, firing, angle0, angle, dir, cool }
+
+// taking a hit: the heart pops, the cat flashes red and is briefly invulnerable, the screen shakes, the combo shatters
+const HIT = { invuln: 1.0, shake: 0.25, shakeMag: 8, comboBreak: 0.9 };
+let screenShake = 0; // seconds left
+let comboBreakFx = null; // { chars: [{ ch, w, x, y, vx, vy, rot, vr }], t }
 const bombs = []; // { x, y, vx, vy, t, phase }
 let attackTimer = 0;
 
@@ -85,6 +94,60 @@ for (const pose of ['idle', 'up', 'down']) {
   catImgs[pose] = new Image();
   catImgs[pose].src = `assets/cat_${pose}.png`;
 }
+// space backdrop: scrolls right to left forever, with an occasional soft shake
+const bgImg = new Image();
+bgImg.src = 'assets/space_bg.png';
+const BG = {
+  speed: 25,            // px per second, right to left
+  zoom: 1.04,           // drawn slightly oversized so the shake never shows the edges
+  shakeEvery: [4, 9],   // seconds between shakes (random in this range)
+  shakeTime: 0.9,       // how long a shake lasts
+  shakeMag: 4,          // px at the peak of a shake
+};
+const bg = { scroll: 0, wait: 6, shakeT: 0, offX: 0, offY: 0 };
+
+function updateBackground(dt) {
+  bg.scroll += BG.speed * dt;
+  if (bg.shakeT > 0) {
+    // smooth in and out, slow wobble rather than jitter
+    const u = 1 - bg.shakeT / BG.shakeTime;
+    const a = BG.shakeMag * Math.sin(Math.PI * u);
+    bg.offX = Math.sin(u * 40) * a;
+    bg.offY = Math.sin(u * 55 + 1) * a;
+    bg.shakeT = Math.max(0, bg.shakeT - dt);
+    if (bg.shakeT === 0) bg.offX = bg.offY = 0;
+  } else {
+    bg.wait -= dt;
+    if (bg.wait <= 0) {
+      bg.shakeT = BG.shakeTime;
+      bg.wait = BG.shakeEvery[0] + Math.random() * (BG.shakeEvery[1] - BG.shakeEvery[0]);
+    }
+  }
+}
+
+// The image is pre-scaled once onto a whole-pixel tile and drawn as a repeating pattern. Drawing separate scaled
+// copies at fractional positions leaves a faint hairline between them; a pattern wraps with no seam at all.
+let bgPattern = null, bgTileW = 0, bgTileH = 0;
+function makeBgPattern() {
+  bgTileH = Math.ceil(canvas.height * BG.zoom);
+  bgTileW = Math.round(bgImg.naturalWidth * (bgTileH / bgImg.naturalHeight));
+  const tile = document.createElement('canvas');
+  tile.width = bgTileW;
+  tile.height = bgTileH;
+  tile.getContext('2d').drawImage(bgImg, 0, 0, bgTileW, bgTileH);
+  bgPattern = ctx.createPattern(tile, 'repeat-x');
+}
+
+function drawBackground() {
+  if (!(bgImg.complete && bgImg.naturalWidth)) return;
+  if (!bgPattern) makeBgPattern();
+  ctx.save();
+  ctx.translate(-(bg.scroll % bgTileW) + bg.offX, -(bgTileH - canvas.height) / 2 + bg.offY);
+  ctx.fillStyle = bgPattern;
+  ctx.fillRect(-bgTileW, 0, canvas.width + 2 * bgTileW, bgTileH);
+  ctx.restore();
+}
+
 const titleImg = new Image();
 titleImg.src = 'assets/title.png';
 const TITLE = {
@@ -95,16 +158,20 @@ const TITLE = {
 const heartImg = new Image();
 heartImg.src = 'assets/hearts.png';
 const CAT_SIZE = 64; // drawn size in px
+// scratch canvas used to make a red-tinted copy of the cat when it's hurt
+const tintCanvas = document.createElement('canvas');
+tintCanvas.width = tintCanvas.height = CAT_SIZE;
+const tintCtx = tintCanvas.getContext('2d');
 const CAT_MAX_TILT = 20 * Math.PI / 180; // lean at full horizontal speed (right = clockwise)
 const CAT_HITBOX = 0.43; // hitbox radius as a fraction of the size (the helmet fills ~86% of the image)
 
-const player = { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0, r: CAT_SIZE * CAT_HITBOX, accel: 1600, friction: 6, maxSpeed: 320 };
+const player = { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0, invuln: 0, r: CAT_SIZE * CAT_HITBOX, accel: 1600, friction: 6, maxSpeed: 320 };
 const boss = { x: BOSS_HOME_X, y: canvas.height / 2, rx: 60, ry: 110, color: '#d65db1', name: '', shakeT: 0, ceaseT: 0 };
 // placeholder names and colors, one per boss/song
 const BOSSES = [
-  { name: 'Sir Woofington', color: '#d65db1' },
-  { name: 'Vacuum-9000', color: '#4f5bd5' },
-  { name: 'Big Cucumber', color: '#e8a75d' },
+  { name: 'Sir Woofington', color: '#d65db1', song: 'assets/audio/pixel_pig.mp3' }, // Di Young - Pixel Pig
+  { name: 'Vacuum-9000', color: '#4f5bd5', locked: true },   // locked until a future update
+  { name: 'Big Cucumber', color: '#e8a75d', locked: true },
 ];
 
 const health = { hp: MAX_HP, regenTimer: 0 };
@@ -170,8 +237,33 @@ const fightEnded = () => fightState === 'won' || fightState === 'lost';
 // pause panel shows immediately, win/lose panels wait for the escape animation
 const overlayVisible = () => fightState === 'paused' || (fightEnded() && endTimer >= END_DELAY);
 
+// The fight's song: its playback position drives the progress bar, and finishing it is the win condition.
+let song = null; // Audio element while a fight is running
+const songLength = () => song && isFinite(song.duration) ? song.duration : FALLBACK_SONG_LENGTH;
+
+function startSong(path) {
+  if (song) song.pause();
+  song = null;
+  if (!path) return;
+  const s = new Audio(path);
+  s.volume = MUSIC_VOLUME;
+  s.addEventListener('error', () => { if (song === s) song = null; }); // fall back to the timer if it can't load
+  song = s;
+  s.play().catch(() => {});
+}
+
+// keep playback in step with the game: plays only while fighting, pauses with the pause menu / end screens, stops in menus
+function syncMusic() {
+  if (!song) return;
+  if (scene !== 'fight') { song.pause(); song = null; return; }
+  const shouldPlay = fightState === 'playing';
+  if (shouldPlay && song.paused && !song.ended) song.play().catch(() => {});
+  else if (!shouldPlay && !song.paused) song.pause();
+}
+
 function startFight(bossIndex) {
   currentBoss = bossIndex;
+  startSong(BOSSES[bossIndex].song);
   Object.assign(boss, { x: BOSS_HOME_X, color: BOSSES[bossIndex].color, name: BOSSES[bossIndex].name });
   fightState = 'playing';
   endTimer = 0;
@@ -191,7 +283,9 @@ function startFight(bossIndex) {
   callout = null;
   typing = null;
   promptTimer = randomPromptGap();
-  Object.assign(player, { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0 });
+  Object.assign(player, { x: 200, y: canvas.height / 2, vx: 0, vy: 0, tilt: 0, invuln: 0 });
+  screenShake = 0;
+  comboBreakFx = null;
   Object.assign(health, { hp: MAX_HP, regenTimer: 0 });
   resetOrbs();
   elapsed = 0;
@@ -350,7 +444,7 @@ function updateSpinner(dt) {
 
   // the orb itself hurts on contact (shares the laser's hit cooldown)
   s.cool = Math.max(0, s.cool - dt);
-  if (fightState === 'playing' && s.cool <= 0 && Math.hypot(s.x - player.x, s.y - player.y) < SPINNER.r + player.r) {
+  if (canHit() && s.cool <= 0 && Math.hypot(s.x - player.x, s.y - player.y) < SPINNER.r + player.r) {
     damagePlayer();
     s.cool = SPINNER.hitCooldown;
   }
@@ -374,7 +468,7 @@ function updateSpinner(dt) {
     return;
   }
   s.angle = s.angle0 + s.dir * SPINNER.spin * lt;
-  if (fightState === 'playing' && lt >= SPINNER.fadeIn && s.cool <= 0 && laserHitsPlayer(s)) {
+  if (canHit() && lt >= SPINNER.fadeIn && s.cool <= 0 && laserHitsPlayer(s)) {
     damagePlayer();
     s.cool = SPINNER.hitCooldown;
   }
@@ -390,19 +484,85 @@ function laserHitsPlayer(s) {
 
 const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb, launchSpinner];
 
+// hits only land while playing and not already invulnerable from the last hit
+const canHit = () => fightState === 'playing' && player.invuln <= 0;
+
 function damagePlayer() {
+  popHeart(orbs[health.hp - 1]); // the heart that's about to disappear
   health.hp = Math.max(0, health.hp - 1);
   health.regenTimer = 0; // regen clock restarts on a hit
   gotHit = true;
+  if (combo > 0) spawnComboBreak(combo);
   combo = 0;
   callout = null;
+  player.invuln = HIT.invuln;
+  screenShake = HIT.shake;
+}
+
+// the lost heart bursts into pink bits
+function popHeart(o) {
+  for (let i = 0; i < 14; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 90 + Math.random() * 130;
+    sparks.push({
+      x: o.x, y: o.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      age: 0, life: 0.5 + Math.random() * 0.4,
+      size: 4 + Math.random() * 3,
+      color: Math.random() < 0.5 ? '#f48fb1' : '#ffc1d9',
+    });
+  }
+}
+
+// the "Combo xN" HUD text breaks into letters that fall away
+function spawnComboBreak(n) {
+  const text = `Combo x${n}`;
+  ctx.font = 'bold 24px Fredoka, sans-serif';
+  const chars = [];
+  for (let i = 0; i < text.length; i++) {
+    chars.push({
+      ch: text[i], w: ctx.measureText(text[i]).width,
+      x: 24 + ctx.measureText(text.slice(0, i)).width, y: 52,
+      vx: (Math.random() - 0.5) * 160, vy: -80 - Math.random() * 120,
+      rot: 0, vr: (Math.random() - 0.5) * 8,
+    });
+  }
+  comboBreakFx = { chars, t: 0 };
+}
+
+function updateComboBreak(dt) {
+  comboBreakFx.t += dt;
+  if (comboBreakFx.t >= HIT.comboBreak) { comboBreakFx = null; return; }
+  for (const c of comboBreakFx.chars) {
+    c.vy += 700 * dt;
+    c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vr * dt;
+  }
+}
+
+function drawComboBreak() {
+  const fx = comboBreakFx;
+  ctx.font = 'bold 24px Fredoka, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#e53935';
+  ctx.globalAlpha = 1 - Math.max(0, (fx.t - 0.3) / (HIT.comboBreak - 0.3)); // hold, then fade
+  for (const c of fx.chars) {
+    ctx.save();
+    ctx.translate(c.x + c.w / 2, c.y + 12);
+    ctx.rotate(c.rot);
+    ctx.fillText(c.ch, 0, 0);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
 }
 
 function updateFight(dt) {
   const playing = fightState === 'playing';
   if (playing) {
-    elapsed = Math.min(elapsed + dt, SONG_LENGTH);
-    if (elapsed >= SONG_LENGTH) endFight('won');
+    // the song's own clock, or a plain timer when there's no song
+    elapsed = Math.min(song ? song.currentTime : elapsed + dt, songLength());
+    if (song ? song.ended : elapsed >= songLength()) {
+      elapsed = songLength();
+      endFight('won');
+    }
   } else {
     endTimer += dt;
   }
@@ -416,6 +576,9 @@ function updateFight(dt) {
     callout.t += dt;
     if (callout.t >= CALLOUT.flash + CALLOUT.fade) callout = null;
   }
+  player.invuln = Math.max(0, player.invuln - dt);
+  screenShake = Math.max(0, screenShake - dt);
+  if (comboBreakFx) updateComboBreak(dt);
 
   // typing prompt: appears at random, disappears if not finished in time
   if (playing) {
@@ -467,7 +630,7 @@ function updateFight(dt) {
     if (b.t >= BEAM.charge + BEAM.fire) {
       spawnBeamSparks(b);
       beams.splice(i, 1);
-    } else if (playing && !b.hit && b.t >= BEAM.charge && beamHitsPlayer(b)) {
+    } else if (canHit() && !b.hit && b.t >= BEAM.charge && beamHitsPlayer(b)) {
       b.hit = true;
       damagePlayer();
     }
@@ -489,7 +652,7 @@ function updateFight(dt) {
     const s = shots[i];
     s.x += s.vx * dt;
     s.y += s.vy * dt;
-    if (playing && Math.hypot(s.x - player.x, s.y - player.y) < SHOT.r + player.r) {
+    if (canHit() && Math.hypot(s.x - player.x, s.y - player.y) < SHOT.r + player.r) {
       damagePlayer();
       shots.splice(i, 1);
     } else if (s.x < -margin || s.x > canvas.width + margin || s.y < -margin || s.y > canvas.height + margin) {
@@ -685,7 +848,7 @@ function drawFight() {
   ctx.moveTo(BAR.x + BAR.w, midY - BAR.capH / 2); ctx.lineTo(BAR.x + BAR.w, midY + BAR.capH / 2);
   ctx.moveTo(BAR.x, midY); ctx.lineTo(BAR.x + BAR.w, midY);
   ctx.stroke();
-  const markX = BAR.x + BAR.w * (elapsed / SONG_LENGTH);
+  const markX = BAR.x + BAR.w * (elapsed / songLength());
   ctx.fillStyle = COLOR.purple;
   ctx.fillRect(markX - 5, midY - 5, 10, 10);
 
@@ -699,6 +862,9 @@ function drawFight() {
     ctx.beginPath();
     ctx.arc(b.x, b.y, BOMB.r, 0, Math.PI * 2);
     ctx.fill();
+    ctx.strokeStyle = COLOR.lavender; // light rim so the black bomb reads on the dark backdrop
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
   // projectiles
@@ -727,7 +893,20 @@ function drawFight() {
     ctx.save();
     ctx.translate(player.x, player.y);
     ctx.rotate(player.tilt);
+    const hurt = player.invuln > 0;
+    const blink = hurt && Math.floor(player.invuln * 12) % 2 === 1 ? 0.35 : 1;
+    ctx.globalAlpha = blink;
     ctx.drawImage(catImg, -CAT_SIZE / 2, -CAT_SIZE / 2, CAT_SIZE, CAT_SIZE);
+    if (hurt) {
+      // red copy of the sprite (opaque pixels only), strongest right after the hit and fading with the invulnerability
+      tintCtx.globalCompositeOperation = 'copy';
+      tintCtx.drawImage(catImg, 0, 0, CAT_SIZE, CAT_SIZE);
+      tintCtx.globalCompositeOperation = 'source-atop';
+      tintCtx.fillStyle = '#ff2d2d';
+      tintCtx.fillRect(0, 0, CAT_SIZE, CAT_SIZE);
+      ctx.globalAlpha = blink * 0.75 * (player.invuln / HIT.invuln);
+      ctx.drawImage(tintCanvas, -CAT_SIZE / 2, -CAT_SIZE / 2);
+    }
     ctx.restore();
   } else {
     ctx.fillStyle = COLOR.ink;
@@ -817,6 +996,9 @@ function drawSpinner() {
   ctx.beginPath();
   ctx.arc(s.x, s.y, SPINNER.r, 0, Math.PI * 2);
   ctx.fill();
+  ctx.strokeStyle = COLOR.lavender; // light rim so it stands out from the purple planets
+  ctx.lineWidth = 3;
+  ctx.stroke();
   ctx.fillStyle = `rgb(255, ${gb}, ${gb})`;
   ctx.beginPath();
   ctx.arc(s.x, s.y, SPINNER.coreR, 0, Math.PI * 2);
@@ -826,13 +1008,14 @@ function drawSpinner() {
 function drawHud() {
   ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
-  ctx.font = 'bold 24px sans-serif';
-  ctx.fillStyle = COLOR.ink;
+  ctx.font = 'bold 24px Fredoka, sans-serif';
+  ctx.fillStyle = COLOR.white;
   ctx.fillText(`Points ${score}`, 24, 20);
   if (combo > 0) {
-    ctx.fillStyle = COLOR.purple;
+    ctx.fillStyle = COLOR.orb;
     ctx.fillText(`Combo x${combo}`, 24, 52);
   }
+  if (comboBreakFx) drawComboBreak();
 }
 
 // combo text: flashes for CALLOUT.flash seconds, then fades out
@@ -845,7 +1028,7 @@ function drawCallout() {
   ctx.scale(pop, pop);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = 'bold 64px sans-serif';
+  ctx.font = 'bold 64px Fredoka, sans-serif';
   ctx.lineJoin = 'round';
   ctx.lineWidth = 8;
   ctx.strokeStyle = COLOR.ink;
@@ -866,7 +1049,7 @@ function drawPrompt() {
 
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = 'bold 36px sans-serif';
+  ctx.font = 'bold 36px Fredoka, sans-serif';
   for (let i = 0; i < n; i++) {
     const x = x0 + i * (boxW + gap);
     const done = i < typing.typed, cur = i === typing.typed;
@@ -893,8 +1076,16 @@ const mouse = { x: -1, y: -1 };
 
 const PLAY_BTN = { w: 220, h: 64, x: (canvas.width - 220) / 2, y: 330 };
 const BANNER = { w: 200, h: 320, gap: 60, y: 110, point: 0.72 }; // point: where the bottom taper starts
-BANNER.x0 = (canvas.width - (BOSSES.length * BANNER.w + (BOSSES.length - 1) * BANNER.gap)) / 2;
-const bannerX = i => BANNER.x0 + i * (BANNER.w + BANNER.gap);
+// boss 1 is centered; bosses 2 and 3 flank it on the left and right, a little higher
+const BANNER_SLOTS = [
+  { dx: 0, dy: 0 },
+  { dx: -(BANNER.w + BANNER.gap), dy: -30 },
+  { dx: BANNER.w + BANNER.gap, dy: -30 },
+];
+const bannerPos = i => ({
+  x: (canvas.width - BANNER.w) / 2 + BANNER_SLOTS[i].dx,
+  y: BANNER.y + BANNER_SLOTS[i].dy,
+});
 
 // upside-down house: flat top, straight sides, point at the bottom
 function bannerPath(x, y) {
@@ -908,7 +1099,21 @@ function bannerPath(x, y) {
 }
 
 const inRect = (r, p) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
-const bannerAt = p => BOSSES.findIndex((_, i) => inRect({ x: bannerX(i), y: BANNER.y, w: BANNER.w, h: BANNER.h }, p));
+// index of the banner under the point (locked ones included, so they can still react to hover), or -1
+const bannerUnder = p => BOSSES.findIndex((_, i) => inRect({ ...bannerPos(i), w: BANNER.w, h: BANNER.h }, p));
+// same, but only playable banners can be picked
+const bannerAt = p => {
+  const i = bannerUnder(p);
+  return i >= 0 && !BOSSES[i].locked ? i : -1;
+};
+
+// move the selection to the next unlocked banner in a direction (+1 / -1)
+function stepSel(dir) {
+  for (let n = 1; n <= BOSSES.length; n++) {
+    const i = (sel + dir * n + BOSSES.length * n) % BOSSES.length;
+    if (!BOSSES[i].locked) { sel = i; return; }
+  }
+}
 const playHovered = () => inRect(PLAY_BTN, mouse);
 
 function onKey(code) {
@@ -916,8 +1121,8 @@ function onKey(code) {
   if (scene === 'title') {
     if (confirm) scene = 'select';
   } else if (scene === 'select') {
-    if (code === 'KeyA') sel = (sel + BOSSES.length - 1) % BOSSES.length;
-    else if (code === 'KeyD') sel = (sel + 1) % BOSSES.length;
+    if (code === 'KeyA') stepSel(-1);
+    else if (code === 'KeyD') stepSel(1);
     else if (confirm) startFight(sel);
     else if (code === 'Escape') scene = 'title';
   } else if (scene === 'fight') {
@@ -964,25 +1169,67 @@ function drawTitle() {
     ctx.drawImage(titleImg, (canvas.width - w) / 2, TITLE.centerY - TITLE.wordmarkY * TITLE.scale, w, h);
   } else {
     ctx.fillStyle = COLOR.purple;
-    ctx.font = 'bold 130px sans-serif';
+    ctx.font = 'bold 130px Fredoka, sans-serif';
     ctx.fillText('AstroCat', canvas.width / 2, 200);
   }
 
   drawButton(PLAY_BTN, 'PLAY');
 }
 
+function roundRectPath(x, y, w, h, rad) {
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
+}
+
+// chunky pill button in the title's colors: plum outline, purple face, pink highlight, cream lettering
 function drawButton(r, label) {
   const hot = inRect(r, mouse);
+  const lift = hot ? 4 : 0;          // hovered buttons rise off their base
+  const rad = r.h / 2;
+  const y = r.y - lift;
+
+  ctx.save();
+  ctx.lineJoin = 'round';
+
+  // base / drop lip
+  roundRectPath(r.x, r.y + 5, r.w, r.h, rad);
+  ctx.fillStyle = '#3a0f2c';
+  ctx.fill();
+
+  // face, with a soft glow when hovered
+  roundRectPath(r.x, y, r.w, r.h, rad);
+  const g = ctx.createLinearGradient(0, y, 0, y + r.h);
+  g.addColorStop(0, hot ? '#d88bc2' : '#b9689f');
+  g.addColorStop(1, hot ? '#a85d95' : '#8a4a7a');
+  ctx.shadowColor = hot ? '#e6a8d6' : 'transparent';
+  ctx.shadowBlur = hot ? 18 : 0;
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = 4;
+  ctx.strokeStyle = '#5c1a45';
+  ctx.stroke();
+
+  // glossy highlight along the top
+  roundRectPath(r.x + 12, y + 7, r.w - 24, r.h * 0.32, r.h * 0.16);
+  ctx.fillStyle = 'rgba(248, 208, 232, 0.35)';
+  ctx.fill();
+
+  // lettering: cream with a plum outline, like the wordmark
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = hot ? COLOR.purple : COLOR.white;
-  ctx.fillRect(r.x, r.y, r.w, r.h);
-  ctx.strokeStyle = COLOR.purple;
-  ctx.lineWidth = 3;
-  ctx.strokeRect(r.x, r.y, r.w, r.h);
-  ctx.fillStyle = hot ? COLOR.white : COLOR.ink;
-  ctx.font = 'bold 34px sans-serif';
-  ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2 + 2);
+  ctx.font = 'bold 34px Fredoka, sans-serif';
+  ctx.lineWidth = 7;
+  ctx.strokeStyle = '#5c1a45';
+  ctx.strokeText(label, r.x + r.w / 2, y + r.h / 2 + 2);
+  ctx.fillStyle = '#fdeaf5';
+  ctx.fillText(label, r.x + r.w / 2, y + r.h / 2 + 2);
+  ctx.restore();
 }
 
 // pause / win / lose panel drawn over the frozen fight
@@ -1060,7 +1307,7 @@ function drawOverlay() {
   const won = fightState === 'won';
   const P = won ? PANEL_WIN : PANEL;
   const cx = canvas.width / 2;
-  const progress = elapsed / SONG_LENGTH;
+  const progress = elapsed / songLength();
 
   ctx.fillStyle = 'rgba(61, 43, 107, 0.35)';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1073,7 +1320,7 @@ function drawOverlay() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = won ? COLOR.purple : COLOR.ink;
-  ctx.font = 'bold 38px sans-serif';
+  ctx.font = 'bold 38px Fredoka, sans-serif';
   ctx.fillText(won ? 'Boss scared away!' : fightState === 'lost' ? 'Defeated!' : 'PAUSED', cx, P.y + 50);
 
   // boss portrait + name
@@ -1082,7 +1329,7 @@ function drawOverlay() {
   ctx.ellipse(cx, P.y + 125, 30, 40, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = COLOR.ink;
-  ctx.font = 'bold 28px sans-serif';
+  ctx.font = 'bold 28px Fredoka, sans-serif';
   ctx.fillText(boss.name, cx, P.y + 185);
 
   // progress: |=====■------|
@@ -1102,15 +1349,15 @@ function drawOverlay() {
   ctx.fillStyle = COLOR.ink;
   ctx.fillRect(bx + bw * progress - 6, by - 6, 12, 12);
   ctx.fillStyle = COLOR.muted;
-  ctx.font = '22px sans-serif';
+  ctx.font = '22px Fredoka, sans-serif';
   ctx.fillText(`${Math.floor(progress * 100)}%`, cx, by + 32);
 
   if (won) {
     ctx.fillStyle = COLOR.purple;
-    ctx.font = 'bold 28px sans-serif';
+    ctx.font = 'bold 28px Fredoka, sans-serif';
     ctx.fillText(`Points: ${score}`, cx, P.y + 295);
     ctx.fillStyle = COLOR.ink;
-    ctx.font = 'bold 24px sans-serif';
+    ctx.font = 'bold 24px Fredoka, sans-serif';
     ctx.fillText(`Highest combo: x${maxCombo}`, cx, P.y + 332);
     drawStars(cx, P.y + 385, endTimer - END_DELAY);
   }
@@ -1118,34 +1365,54 @@ function drawOverlay() {
   for (const b of overlayButtons()) drawButton(b.r, b.label);
 }
 
+// banners glide up when hovered and settle back down when not
+const BANNER_LIFT = 12;
+const bannerLift = BOSSES.map(() => 0);
+function updateSelect(dt) {
+  const hovered = bannerUnder(mouse);
+  const k = 1 - Math.exp(-18 * dt);
+  BOSSES.forEach((_, i) => {
+    bannerLift[i] += ((i === hovered ? BANNER_LIFT : 0) - bannerLift[i]) * k;
+  });
+}
+
 function drawSelect() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = COLOR.muted;
-  ctx.font = 'bold 28px sans-serif';
-  ctx.fillText('Choose your fight', canvas.width / 2, 55);
+  ctx.fillStyle = COLOR.lavender;
+  ctx.font = 'bold 28px Fredoka, sans-serif';
+  ctx.fillText('Save the world!', canvas.width / 2, 55);
 
+  const hovered = bannerUnder(mouse);
   BOSSES.forEach((b, i) => {
-    const active = i === sel;
-    const x = bannerX(i), y = BANNER.y + (active ? -12 : 0);
+    const active = i === hovered; // dark outline (and lift) only while hovered, for every banner
+    const pos = bannerPos(i);
+    const x = pos.x, y = pos.y - bannerLift[i]; // lift is animated, and only from hovering (locked ones too)
     bannerPath(x, y);
-    ctx.fillStyle = b.color;
-    ctx.globalAlpha = active ? 1 : 0.65;
+    // locked bosses are grayed out
+    ctx.fillStyle = b.locked ? '#d9d5e3' : b.color;
+    ctx.globalAlpha = b.locked ? 0.8 : 1;
     ctx.fill();
     ctx.globalAlpha = 1;
     ctx.strokeStyle = active ? COLOR.ink : COLOR.track;
     ctx.lineWidth = active ? 5 : 3;
     ctx.stroke();
 
-    ctx.font = 'bold 72px sans-serif';
+    ctx.font = 'bold 72px Fredoka, sans-serif';
     ctx.lineWidth = 6;
-    ctx.strokeStyle = COLOR.ink;
+    ctx.strokeStyle = b.locked ? COLOR.track : COLOR.ink;
     ctx.strokeText(String(i + 1), x + BANNER.w / 2, y + BANNER.h * 0.4);
     ctx.fillStyle = COLOR.white;
     ctx.fillText(String(i + 1), x + BANNER.w / 2, y + BANNER.h * 0.4);
 
-    // best stars earned against this boss, empty slots included
-    drawStarRow(x + BANNER.w / 2, BANNER.y + BANNER.h + 40, 14, 38, bestStars[i]);
+    if (b.locked) {
+      ctx.fillStyle = COLOR.muted;
+      ctx.font = 'bold 20px Fredoka, sans-serif';
+      ctx.fillText('Coming soon', x + BANNER.w / 2, y + BANNER.h * 0.62);
+    } else {
+      // best stars earned against this boss, empty slots included
+      drawStarRow(x + BANNER.w / 2, pos.y + BANNER.h + 40, 14, 38, bestStars[i]);
+    }
   });
 }
 
@@ -1154,13 +1421,23 @@ function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.05); // clamp after tab switches
   last = now;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!(scene === 'fight' && fightState === 'paused')) updateBackground(dt); // freezes while paused
+  drawBackground();
   if (scene === 'title') drawTitle();
-  else if (scene === 'select') drawSelect();
+  else if (scene === 'select') { updateSelect(dt); drawSelect(); }
   else {
     if (fightState !== 'paused') updateFight(dt);
+    // screen shake after a hit, fading out (held still while paused)
+    ctx.save();
+    if (screenShake > 0 && fightState !== 'paused') {
+      const mag = HIT.shakeMag * (screenShake / HIT.shake);
+      ctx.translate((Math.random() * 2 - 1) * mag, (Math.random() * 2 - 1) * mag);
+    }
     drawFight();
+    ctx.restore();
     if (overlayVisible()) drawOverlay();
   }
+  syncMusic();
   canvas.style.cursor = scene === 'fight' && !overlayVisible() ? 'none' : 'default'; // no cursor while fighting
   requestAnimationFrame(frame);
 }
