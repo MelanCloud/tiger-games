@@ -47,13 +47,13 @@ const sparks = []; // { x, y, vx, vy, age, life, size, color }
 // spinner: a purple orb is thrown into the arena, its white center flashes red faster and faster,
 // then it fires a laser that spins around it. Only one can exist at a time.
 const SPINNER = {
-  r: 30, coreR: 13,
+  r: 24, coreR: 10.4,
   drag: 2.5,          // skid to a stop (travel = launch speed / drag)
   margin: 120,        // it always lands at least this far from the left, top and bottom borders and the boss's column
   fuse: 2.0,          // seconds of flashing before the laser
   fadeIn: 0.25,       // the laser fades in and can't hurt until it's fully visible
   laser: 3.0,         // seconds the laser spins
-  spin: 1.12,         // radians per second
+  spin: 1.008,        // radians per second
   length: Math.hypot(canvas.width, canvas.height), // long enough to cross the whole arena from anywhere in it
   width: 18,
   hitCooldown: 0.8,   // after a hit, the laser can't hurt again for this long
@@ -85,6 +85,13 @@ for (const pose of ['idle', 'up', 'down']) {
   catImgs[pose] = new Image();
   catImgs[pose].src = `assets/cat_${pose}.png`;
 }
+const titleImg = new Image();
+titleImg.src = 'assets/title.png';
+const TITLE = {
+  scale: 0.7,      // 1 = fill the canvas
+  centerY: 207,    // where the wordmark's vertical center lands on the canvas
+  wordmarkY: 253,  // where the wordmark's center sits within the full-size image (in canvas px)
+};
 const heartImg = new Image();
 heartImg.src = 'assets/hearts.png';
 const CAT_SIZE = 64; // drawn size in px
@@ -139,6 +146,22 @@ let endTimer = 0; // seconds since the fight ended
 let score = 0;
 let combo = 0;         // consecutive completed prompts since the last hit taken
 let maxCombo = 0;      // highest combo reached this fight
+let gotHit = false;    // whether the player took any damage this fight
+let winStars = [false, false, false];
+let currentBoss = 0;   // index into BOSSES for the fight in progress
+
+// best star count per boss, kept across page reloads
+const STARS_KEY = 'astrocat.stars';
+const bestStars = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STARS_KEY));
+    if (Array.isArray(saved)) return BOSSES.map((_, i) => Math.min(3, Math.max(0, saved[i] | 0)));
+  } catch (e) { /* storage unavailable or corrupt: start fresh */ }
+  return BOSSES.map(() => 0);
+})();
+function saveStars() {
+  try { localStorage.setItem(STARS_KEY, JSON.stringify(bestStars)); } catch (e) { /* ignore */ }
+}
 let callout = null;    // { text, t } combo text on screen
 let typing = null;     // { chars, typed, t, errorT } the active prompt
 let promptTimer = 0;   // seconds until the next prompt appears
@@ -148,6 +171,7 @@ const fightEnded = () => fightState === 'won' || fightState === 'lost';
 const overlayVisible = () => fightState === 'paused' || (fightEnded() && endTimer >= END_DELAY);
 
 function startFight(bossIndex) {
+  currentBoss = bossIndex;
   Object.assign(boss, { x: BOSS_HOME_X, color: BOSSES[bossIndex].color, name: BOSSES[bossIndex].name });
   fightState = 'playing';
   endTimer = 0;
@@ -162,6 +186,8 @@ function startFight(bossIndex) {
   Object.assign(boss, { shakeT: 0, ceaseT: 0 });
   combo = 0;
   maxCombo = 0;
+  gotHit = false;
+  winStars = [false, false, false];
   callout = null;
   typing = null;
   promptTimer = randomPromptGap();
@@ -172,7 +198,16 @@ function startFight(bossIndex) {
   scene = 'fight';
 }
 
+const STAR_COMBO = 5; // highest combo needed for the second star
+
 function endFight(result) {
+  // star tiers, each includes the ones below it: 1 = win, 2 = win with a big combo, 3 = win without being hit
+  const tier = result !== 'won' ? 0 : !gotHit ? 3 : maxCombo >= STAR_COMBO ? 2 : 1;
+  winStars = [tier >= 1, tier >= 2, tier >= 3];
+  if (tier > bestStars[currentBoss]) {
+    bestStars[currentBoss] = tier;
+    saveStars();
+  }
   fightState = result;
   endTimer = 0;
   regen = null;
@@ -358,6 +393,7 @@ const ATTACKS = [shootRandomAngle, shootUp, shootDown, throwBomb, launchSpinner]
 function damagePlayer() {
   health.hp = Math.max(0, health.hp - 1);
   health.regenTimer = 0; // regen clock restarts on a hit
+  gotHit = true;
   combo = 0;
   callout = null;
 }
@@ -922,9 +958,15 @@ canvas.addEventListener('click', e => {
 function drawTitle() {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = COLOR.purple;
-  ctx.font = 'bold 130px sans-serif';
-  ctx.fillText('AstroCat', canvas.width / 2, 200);
+  if (titleImg.complete && titleImg.naturalWidth) {
+    // 16:9 image scaled about the wordmark's center, so it stays centered above the PLAY button
+    const w = canvas.width * TITLE.scale, h = canvas.height * TITLE.scale;
+    ctx.drawImage(titleImg, (canvas.width - w) / 2, TITLE.centerY - TITLE.wordmarkY * TITLE.scale, w, h);
+  } else {
+    ctx.fillStyle = COLOR.purple;
+    ctx.font = 'bold 130px sans-serif';
+    ctx.fillText('AstroCat', canvas.width / 2, 200);
+  }
 
   drawButton(PLAY_BTN, 'PLAY');
 }
@@ -945,7 +987,9 @@ function drawButton(r, label) {
 
 // pause / win / lose panel drawn over the frozen fight
 const PANEL = { w: 460, h: 450, x: (canvas.width - 460) / 2, y: 45 };
-const btnAt = y => ({ w: 220, h: 64, x: (canvas.width - 220) / 2, y: PANEL.y + y });
+// the win panel is taller to make room for the star row
+const PANEL_WIN = { w: 460, h: 510, x: (canvas.width - 460) / 2, y: 15 };
+const btnAt = (y, panel = PANEL) => ({ w: 220, h: 64, x: (canvas.width - 220) / 2, y: panel.y + y });
 const resumeFight = () => { fightState = 'playing'; };
 const goLobby = () => { scene = 'title'; };
 const PAUSE_BUTTONS = [
@@ -953,38 +997,96 @@ const PAUSE_BUTTONS = [
   { r: btnAt(366), label: 'LOBBY', action: goLobby },
 ];
 const END_BUTTONS = [{ r: btnAt(PANEL.h - 90), label: 'LOBBY', action: goLobby }];
-const overlayButtons = () => fightState === 'paused' ? PAUSE_BUTTONS : END_BUTTONS;
+const WIN_BUTTONS = [{ r: btnAt(PANEL_WIN.h - 80, PANEL_WIN), label: 'LOBBY', action: goLobby }];
+const overlayButtons = () => fightState === 'paused' ? PAUSE_BUTTONS : fightState === 'won' ? WIN_BUTTONS : END_BUTTONS;
+
+// 5-point star centered at (cx, cy) with outer radius R
+function starPath(cx, cy, R) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    const rad = i % 2 === 0 ? R : R * 0.45;
+    ctx[i === 0 ? 'moveTo' : 'lineTo'](cx + Math.cos(a) * rad, cy + Math.sin(a) * rad);
+  }
+  ctx.closePath();
+}
+
+// static row of three stars, the first `filled` of them lit
+function drawStarRow(cx, cy, R, spacing, filled) {
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  for (let i = 0; i < 3; i++) {
+    starPath(cx + (i - 1) * spacing, cy, R);
+    ctx.fillStyle = i < filled ? COLOR.purple : COLOR.lavender;
+    ctx.fill();
+    ctx.strokeStyle = i < filled ? COLOR.ink : COLOR.track;
+    ctx.stroke();
+  }
+  ctx.lineJoin = 'miter';
+}
+
+// three slots; each earned star fills in left to right, `t` = seconds since the panel appeared
+const easeOutBack = p => 1 + 2.70158 * Math.pow(p - 1, 3) + 1.70158 * Math.pow(p - 1, 2);
+function drawStars(cx, cy, t) {
+  const R = 24, spacing = 64;
+  for (let i = 0; i < 3; i++) {
+    const x = cx + (i - 1) * spacing;
+    starPath(x, cy, R);
+    ctx.fillStyle = COLOR.lavender;
+    ctx.fill();
+    ctx.strokeStyle = COLOR.track;
+    ctx.lineWidth = 3;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    const p = Math.max(0, Math.min(1, (t - (0.35 + i * 0.55)) / 0.4));
+    if (winStars[i] && p > 0) {
+      const s = easeOutBack(p);
+      ctx.save();
+      ctx.translate(x, cy);
+      ctx.scale(s, s);
+      starPath(0, 0, R);
+      ctx.fillStyle = COLOR.purple;
+      ctx.fill();
+      ctx.strokeStyle = COLOR.ink;
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.lineJoin = 'miter';
+  }
+}
 
 function drawOverlay() {
   const won = fightState === 'won';
+  const P = won ? PANEL_WIN : PANEL;
   const cx = canvas.width / 2;
   const progress = elapsed / SONG_LENGTH;
 
   ctx.fillStyle = 'rgba(61, 43, 107, 0.35)';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = COLOR.white;
-  ctx.fillRect(PANEL.x, PANEL.y, PANEL.w, PANEL.h);
+  ctx.fillRect(P.x, P.y, P.w, P.h);
   ctx.strokeStyle = boss.color;
   ctx.lineWidth = 4;
-  ctx.strokeRect(PANEL.x, PANEL.y, PANEL.w, PANEL.h);
+  ctx.strokeRect(P.x, P.y, P.w, P.h);
 
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = won ? COLOR.purple : COLOR.ink;
   ctx.font = 'bold 38px sans-serif';
-  ctx.fillText(won ? 'Boss scared away!' : fightState === 'lost' ? 'Defeated!' : 'PAUSED', cx, PANEL.y + 50);
+  ctx.fillText(won ? 'Boss scared away!' : fightState === 'lost' ? 'Defeated!' : 'PAUSED', cx, P.y + 50);
 
   // boss portrait + name
   ctx.fillStyle = boss.color;
   ctx.beginPath();
-  ctx.ellipse(cx, PANEL.y + 125, 30, 40, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx, P.y + 125, 30, 40, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = COLOR.ink;
   ctx.font = 'bold 28px sans-serif';
-  ctx.fillText(boss.name, cx, PANEL.y + 185);
+  ctx.fillText(boss.name, cx, P.y + 185);
 
   // progress: |=====■------|
-  const bw = 320, bx = cx - bw / 2, by = PANEL.y + 225, capH = 20;
+  const bw = 320, bx = cx - bw / 2, by = P.y + 225, capH = 20;
   ctx.lineWidth = 2;
   ctx.strokeStyle = COLOR.track;
   ctx.beginPath();
@@ -1006,10 +1108,11 @@ function drawOverlay() {
   if (won) {
     ctx.fillStyle = COLOR.purple;
     ctx.font = 'bold 28px sans-serif';
-    ctx.fillText(`Points: ${score}`, cx, PANEL.y + 295);
+    ctx.fillText(`Points: ${score}`, cx, P.y + 295);
     ctx.fillStyle = COLOR.ink;
     ctx.font = 'bold 24px sans-serif';
-    ctx.fillText(`Highest combo: x${maxCombo}`, cx, PANEL.y + 332);
+    ctx.fillText(`Highest combo: x${maxCombo}`, cx, P.y + 332);
+    drawStars(cx, P.y + 385, endTimer - END_DELAY);
   }
 
   for (const b of overlayButtons()) drawButton(b.r, b.label);
@@ -1040,6 +1143,9 @@ function drawSelect() {
     ctx.strokeText(String(i + 1), x + BANNER.w / 2, y + BANNER.h * 0.4);
     ctx.fillStyle = COLOR.white;
     ctx.fillText(String(i + 1), x + BANNER.w / 2, y + BANNER.h * 0.4);
+
+    // best stars earned against this boss, empty slots included
+    drawStarRow(x + BANNER.w / 2, BANNER.y + BANNER.h + 40, 14, 38, bestStars[i]);
   });
 }
 
